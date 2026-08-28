@@ -40,8 +40,22 @@ except ImportError:
 STAGE_CMD = {0: "1.00", 1: "2.00", 2: "3.00", 3: "4.00", -1: "6.00"}
 
 
+# setup.sh 가 udev 로 만들어주는 고정 이름. 어느 PC 에서도 동일하다.
+PORT_SYMLINKS = ("/dev/t870_mcu",)
+
+
 def find_arduino_port():
-    """USB 장치 정보로 아두이노를 찾는다. 포트 번호는 꽂는 순서마다 바뀐다."""
+    """아두이노 포트를 찾는다. 포트 번호는 꽂는 순서마다 바뀌므로 믿지 않는다.
+
+    1) udev 심볼릭 링크 (/dev/t870_mcu)
+    2) /dev/serial/by-id 장치 이름 매칭
+    못 찾으면 None. ★ 예전에는 여기서 /dev/ttyACM* 의 첫 번째를 그냥 집었는데,
+      거기 GPS 가 앉아 있으면 GPS 포트에 구동 명령을 쏘게 된다.
+    """
+    for link in PORT_SYMLINKS:
+        if os.path.exists(link):
+            return os.path.realpath(link)
+
     base = "/dev/serial/by-id"
     if os.path.isdir(base):
         best = None
@@ -55,8 +69,7 @@ def find_arduino_port():
                 best = os.path.realpath(os.path.join(base, name))
         if best:
             return best
-    ports = sorted(glob.glob("/dev/ttyACM*"))
-    return ports[0] if ports else None
+    return None
 FEED_HZ = 10.0
 STATUS_HZ = 5.0
 WHEEL_CIRC = 0.817          # 바퀴 둘레 [m] (지름 0.26)

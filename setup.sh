@@ -9,19 +9,65 @@
 #  사용:
 #      chmod +x setup.sh
 #      ./setup.sh
+#
+#  ★ 이 스크립트는 중간에 실패해도 멈추지 않는다.
+#    팀원 PC 에 깨진 apt 저장소(Spotify, VS Code 등)가 하나만 있어도
+#    apt-get update 가 실패하는데, 그것 때문에 정작 중요한 udev 규칙이
+#    안 깔리면 안 되기 때문이다. 실패한 단계는 경고로 표시하고 넘어간다.
+#
+#  --skip-apt  로 패키지 설치 단계를 아예 건너뛸 수 있다.
 # ==========================================================
-set -e
+
+# set -e 를 쓰지 않는다. (위 이유)
+SKIP_APT=0
+for arg in "$@"; do
+    case "$arg" in
+        --skip-apt) SKIP_APT=1 ;;
+        -h|--help)
+            echo "사용: ./setup.sh [--skip-apt]"; exit 0 ;;
+    esac
+done
+
+WARNINGS=()
+warn() { WARNINGS+=("$1"); echo "      ⚠ $1"; }
+
+# 워크스페이스 경로는 스크립트 위치에서 구한다.
+# ★ ~/mcu_ws 로 박아두면 팀원이 다른 곳에 클론했을 때 안내가 전부 틀린다.
+WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "=========================================================="
 echo "  T870 MCU 설치"
+echo "  워크스페이스: $WS_DIR"
 echo "=========================================================="
 
 # ---------- 1. 의존 패키지 ----------
 echo ""
 echo "[1/5] 의존 패키지"
-sudo apt-get update -qq
-sudo apt-get install -y python3-serial python3-colcon-common-extensions >/dev/null
-echo "      python3-serial, colcon 확인"
+
+need_pkgs=()
+python3 -c "import serial" 2>/dev/null || need_pkgs+=(python3-serial)
+command -v colcon >/dev/null 2>&1 || need_pkgs+=(python3-colcon-common-extensions)
+
+if [ "$SKIP_APT" -eq 1 ]; then
+    echo "      --skip-apt 지정됨 — 건너뛴다"
+    [ ${#need_pkgs[@]} -gt 0 ] && warn "설치 필요: ${need_pkgs[*]}"
+elif [ ${#need_pkgs[@]} -eq 0 ]; then
+    echo "      python3-serial, colcon 이미 설치됨 — apt 생략"
+else
+    echo "      설치 필요: ${need_pkgs[*]}"
+    # apt-get update 실패는 대개 우리와 무관한 서드파티 저장소 문제다.
+    # 실패해도 설치는 시도해 본다 (캐시에 있으면 그대로 깔린다).
+    if ! sudo apt-get update -qq 2>/dev/null; then
+        warn "apt-get update 실패 — 깨진 저장소가 있는 것 같다. 설치는 계속 시도한다"
+        echo "        (확인: sudo apt-get update  로 어느 저장소인지 볼 수 있다)"
+    fi
+    if sudo apt-get install -y "${need_pkgs[@]}" >/dev/null 2>&1; then
+        echo "      설치 완료"
+    else
+        warn "패키지 설치 실패: ${need_pkgs[*]}"
+        echo "        수동 설치: sudo apt-get install ${need_pkgs[*]}"
+    fi
+fi
 
 # ---------- 2. dialout 그룹 ----------
 echo ""
@@ -60,9 +106,11 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="1546", MODE="0666", SYMLINK+="t870_gps"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", MODE="0666", SYMLINK+="t870_lidar"
 RULES
 
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-echo "      /etc/udev/rules.d/99-t870.rules 적용"
+if sudo udevadm control --reload-rules && sudo udevadm trigger; then
+    echo "      /etc/udev/rules.d/99-t870.rules 적용"
+else
+    warn "udev 규칙 재적용 실패 — 재부팅하면 적용된다"
+fi
 
 # ---------- 4. 현재 포트에 즉시 권한 ----------
 echo ""
@@ -91,21 +139,28 @@ fi
 
 echo ""
 echo "=========================================================="
-echo "  설치 완료"
+if [ ${#WARNINGS[@]} -eq 0 ]; then
+    echo "  설치 완료"
+else
+    echo "  설치 완료 (경고 ${#WARNINGS[@]}건)"
+    for w in "${WARNINGS[@]}"; do echo "    ⚠ $w"; done
+    echo ""
+    echo "  경고가 있어도 /dev/t870_mcu 가 만들어졌으면 사용에는 지장이 없다."
+fi
 echo "=========================================================="
-cat << 'NEXT'
+cat << NEXT
 
   빌드:
-      cd ~/mcu_ws && colcon build --symlink-install
-      source install/setup.bash
+      cd "$WS_DIR" && colcon build --symlink-install
+      source "$WS_DIR/install/setup.bash"
 
   실행 (포트를 적을 필요가 없다. 자동으로 찾는다):
       ros2 launch t870_mcu t870_mcu.launch.py
 
   조종:
-      python3 tools/drive_wasd.py
+      python3 "$WS_DIR/tools/drive_wasd.py"
 
   포트가 안 잡히면:
-      python3 tools/check_ports.py
+      python3 "$WS_DIR/tools/check_ports.py"
 
 NEXT

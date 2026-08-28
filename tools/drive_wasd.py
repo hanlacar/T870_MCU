@@ -37,6 +37,16 @@ drive_wasd_v1_0826.py  —  T870 키보드 수동 조종 (WASD)
 ----
     브릿지가 시리얼 포트를 쓰므로 measure.py 와 동시 실행 불가.
     첫 주행은 반드시 1단으로, 앞 공간을 확보하고 할 것.
+
+토픽 이름 바꾸기 (0828: 하드코딩 제거)
+--------------------------------------
+    기본값은 manual 소스 규약(/manual_drive 등)이다. 다른 이름을 쓰려면:
+
+        python3 tools/drive_wasd.py --source safety      # /safety_drive ...
+        python3 tools/drive_wasd.py --mcu-ns /mcu2       # 발행 토픽 접두어
+        python3 tools/drive_wasd.py --estop-topic /my_estop
+
+    --source 는 매니저 yaml 의 source_names 에 있는 이름이어야 중재된다.
 """
 
 import argparse
@@ -61,7 +71,8 @@ STEER_MAX = 27
 
 class Drive(Node):
 
-    def __init__(self, hz, distance):
+    def __init__(self, hz, distance, source="manual", mcu_ns="/mcu",
+                 estop_topic="/estop_lock", reset_service=None):
         super().__init__("drive_wasd")
 
         # 내 명령
@@ -95,40 +106,48 @@ class Drive(Node):
         self.raw_at = 0.0
         self.msg = ""
 
-        self.pub_d = self.create_publisher(Float32, "/manual_drive", 10)
-        self.pub_w = self.create_publisher(Int32, "/manual_wheel", 10)
-        self.pub_s = self.create_publisher(Bool, "/manual_stop", 10)
-        self.pub_e = self.create_publisher(Bool, "/estop_lock", 10)
-        self.cli_reset = self.create_client(Trigger, "/mcu/reset_estop")
+        # 토픽 이름은 전부 인자로 받는다. 코드에 박아두면 팀원이 소스 이름을
+        # 바꿀 때마다 파일을 고쳐야 한다.
+        ns = mcu_ns.rstrip("/")
+        self.source = source
+        self.mcu_ns = ns
+        if reset_service is None:
+            reset_service = ns + "/reset_estop"
+
+        self.pub_d = self.create_publisher(Float32, "/%s_drive" % source, 10)
+        self.pub_w = self.create_publisher(Int32, "/%s_wheel" % source, 10)
+        self.pub_s = self.create_publisher(Bool, "/%s_stop" % source, 10)
+        self.pub_e = self.create_publisher(Bool, estop_topic, 10)
+        self.cli_reset = self.create_client(Trigger, reset_service)
 
         sub = self.create_subscription
-        sub(Int32, "/mcu/encoder", lambda m: setattr(self, "enc", int(m.data)), 10)
-        sub(Float32, "/mcu/rpm", lambda m: setattr(self, "rpm", float(m.data)), 10)
-        sub(Float32, "/mcu/distance_m",
+        sub(Int32, ns + "/encoder", lambda m: setattr(self, "enc", int(m.data)), 10)
+        sub(Float32, ns + "/rpm", lambda m: setattr(self, "rpm", float(m.data)), 10)
+        sub(Float32, ns + "/distance_m",
             lambda m: setattr(self, "dist_m", float(m.data)), 10)
-        sub(Float32, "/mcu/speed_mps",
+        sub(Float32, ns + "/speed_mps",
             lambda m: setattr(self, "speed", float(m.data)), 10)
-        sub(String, "/mcu/fw_state",
+        sub(String, ns + "/fw_state",
             lambda m: setattr(self, "fw_state", str(m.data)), 10)
-        sub(Bool, "/mcu/connected",
+        sub(Bool, ns + "/connected",
             lambda m: setattr(self, "connected", bool(m.data)), 10)
-        sub(Bool, "/mcu/telemetry_ok",
+        sub(Bool, ns + "/telemetry_ok",
             lambda m: setattr(self, "tele_ok", bool(m.data)), 10)
-        sub(Bool, "/mcu/estop_latched",
+        sub(Bool, ns + "/estop_latched",
             lambda m: setattr(self, "estop_latched", bool(m.data)), 10)
-        sub(String, "/mcu/safety_state",
+        sub(String, ns + "/safety_state",
             lambda m: setattr(self, "safety", str(m.data)), 10)
-        sub(String, "/mcu/active_drive_source",
+        sub(String, ns + "/active_drive_source",
             lambda m: setattr(self, "act_drive", str(m.data)), 10)
-        sub(String, "/mcu/active_wheel_source",
+        sub(String, ns + "/active_wheel_source",
             lambda m: setattr(self, "act_wheel", str(m.data)), 10)
-        sub(String, "/mcu/current_mode",
+        sub(String, ns + "/current_mode",
             lambda m: setattr(self, "mode", str(m.data)), 10)
-        sub(Float32, "/mcu/cmd_drive",
+        sub(Float32, ns + "/cmd_drive",
             lambda m: setattr(self, "out_drive", float(m.data)), 10)
-        sub(Int32, "/mcu/cmd_wheel",
+        sub(Int32, ns + "/cmd_wheel",
             lambda m: setattr(self, "out_wheel", int(m.data)), 10)
-        sub(String, "/mcu/raw_status", self._cb_raw, 10)
+        sub(String, ns + "/raw_status", self._cb_raw, 10)
 
         self.create_timer(1.0 / hz, self._publish)
 
@@ -362,10 +381,19 @@ def main():
     ap.add_argument("--hz", type=float, default=10.0)
     ap.add_argument("--distance", type=float, default=10.0,
                     help="Z~X 구간의 실제 거리 [m]")
+    ap.add_argument("--source", default="manual",
+                    help="발행할 소스 이름. /<source>_drive 등으로 발행한다. "
+                         "매니저 yaml 의 source_names 에 있어야 한다")
+    ap.add_argument("--mcu-ns", default="/mcu",
+                    help="MCU 발행 토픽 접두어")
+    ap.add_argument("--estop-topic", default="/estop_lock")
+    ap.add_argument("--reset-service", default=None,
+                    help="기본값은 <mcu-ns>/reset_estop")
     args = ap.parse_args()
 
     rclpy.init()
-    node = Drive(args.hz, args.distance)
+    node = Drive(args.hz, args.distance, args.source, args.mcu_ns,
+                 args.estop_topic, args.reset_service)
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
     fd = sys.stdin.fileno()

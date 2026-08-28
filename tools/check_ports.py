@@ -131,6 +131,17 @@ def main():
     print("  T870 포트 확인")
     print("=" * 62)
 
+    # setup.sh 의 udev 규칙이 만들어주는 고정 이름부터 보여준다.
+    # 이게 살아 있으면 포트 번호는 신경 쓸 필요가 없다.
+    fixed = sorted(glob.glob("/dev/t870_*"))
+    if fixed:
+        print("\n  고정 이름 (udev):")
+        for link in fixed:
+            print("     %-16s -> %s" % (link, os.path.realpath(link)))
+    else:
+        print("\n  고정 이름 없음 — ./setup.sh 를 한 번 실행하면"
+              " /dev/t870_mcu 로 고정된다")
+
     ports = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
     if not ports:
         sys.exit("\n  시리얼 포트가 하나도 없다. USB 연결을 확인하라.")

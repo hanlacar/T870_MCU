@@ -16,8 +16,8 @@ GPS   ─┘                  ▲
 ## 설치
 
 ```bash
-git clone <이 저장소> ~/mcu_ws
-cd ~/mcu_ws
+git clone https://github.com/hanlacar/T870_MCU.git ~/mcu_ws   # 위치는 자유
+cd <워크스페이스>
 chmod +x setup.sh && ./setup.sh
 colcon build --symlink-install
 source install/setup.bash
@@ -42,7 +42,7 @@ ros2 launch t870_mcu t870_mcu.launch.py
 
 특정 포트를 강제하려면:
 ```bash
-ros2 launch t870_mcu t870_mcu.launch.py port:=/dev/ttyACM1
+ros2 launch t870_mcu t870_mcu.launch.py port:=/dev/t870_mcu
 ```
 
 ### 수동 조종

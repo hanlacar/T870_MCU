@@ -29,7 +29,34 @@ v1 대비 수정 사항
    → coasting_policy 로 선택. 기본은 직전 진행 방향을 유지해 적산.
 
 [보완] 5. 수신 버퍼 무한 증가 방어, 파라미터 타입 완화,
-        시리얼 통신 두절 감시(/arduino/telemetry_ok) 추가.
+        시리얼 통신 두절 감시 추가.
+
+v3 (2026-08-28) — 급정거 정상화 + 하드코딩 제거
+-----------------------------------------------
+[치명] 6. 급정거가 급정거가 아니었다
+   estop_serial_command 기본값이 v28 시절의 "1.00"(감속 램프 정지)로 남아
+   있었다. v29 부터 램프를 건너뛰는 제동 명령 B 가 있는데 쓰지 않았다.
+   → 기본값을 "B" 로 바꿨다.
+
+[치명] 7. 제동 명령을 반복 전송하면 차가 뒤로 간다
+   펌웨어 requestBrake() 는 호출될 때마다 제동 펄스 타이머를 다시 찍는다.
+   브릿지 전송 주기(기본 100ms)가 BRAKE_PULSE_MS(150ms)보다 짧아서,
+   매 주기 B 를 보내면 펄스 종료 조건이 영원히 성립하지 않고 역토크가
+   계속 걸린 채 유지된다 → 역주행.
+   → 제동은 상승 에지에 1회만. 이후에는 정지 유지 명령만 반복해
+     펌웨어 워치독을 먹인다. (estop_hold_command / estop_repeat_s)
+
+[중대] 8. 포트 하드코딩 제거
+   setup.sh 가 udev 로 /dev/t870_mcu 심볼릭 링크를 만드는데 코드가 그걸
+   보지 않았다. 이제 심볼릭 링크를 1순위로 본다(port_symlinks).
+   못 찾았을 때 /dev/ttyACM0 을 무작정 여는 동작도 없앴다 — 그 자리에
+   GPS 가 앉아 있을 수 있다. fallback_port 를 명시할 때만 시도한다.
+
+[중대] 9. 발행 토픽 기본값을 전부 /mcu/* 로
+   기본값이 /rpm, /inpulse, /steer_angle 같은 최상위 이름이라 yaml 없이
+   노드를 띄우면 다른 팀 토픽과 충돌했다. 팀 배포용으로 안전하지 않다.
+
+[보완] 10. /estop_lock, /mcu/reset_estop 도 파라미터로 뺐다.
 """
 
 import math
@@ -67,6 +94,10 @@ CONN_READY = 2         # 통신 가능
 
 MAX_RX_BUF = 8192      # 개행 없는 쓰레기 유입 시 메모리 방어
 
+# 펌웨어 BRAKE_PULSE_MS = 150ms.
+# 제동 재시도 간격이 이보다 짧으면 펄스가 끝나지 않아 역주행한다.
+BRAKE_PULSE_GUARD_S = 0.25
+
 
 # ==========================================================
 # 포트 자동 탐색
@@ -81,11 +112,25 @@ ARDUINO_HINTS = ("arduino", "mega", "ch340", "ch910", "wch", "usb2.0-serial")
 NOT_ARDUINO_HINTS = ("u-blox", "u_blox", "gnss", "gps")
 
 
-def find_arduino_port(logger=None):
-    """/dev/serial/by-id 를 훑어 아두이노로 보이는 포트를 고른다.
+def find_arduino_port(logger=None, symlinks=()):
+    """아두이노 시리얼 포트를 찾는다.
 
-    반환: 포트 경로. 못 찾으면 None.
+    탐색 순서
+      1) udev 심볼릭 링크 (기본 /dev/t870_mcu — setup.sh 가 만든다)
+         벤더 ID 기준이라 어느 컴퓨터에서도 같은 이름이 나온다.
+         팀원 PC 마다 포트 번호가 다른 문제를 여기서 끝낸다.
+      2) /dev/serial/by-id 의 장치 이름 매칭 (심볼릭 링크가 없을 때)
+
+    반환: 포트 실제 경로. 못 찾으면 None.
     """
+    for link in symlinks:
+        link = str(link).strip()
+        if link and os.path.exists(link):
+            real = os.path.realpath(link)
+            if logger is not None:
+                logger.info("udev 심볼릭 링크 사용: %s -> %s" % (link, real))
+            return real
+
     base = "/dev/serial/by-id"
     if not os.path.isdir(base):
         return None
@@ -120,6 +165,16 @@ class McuBridge(Node):
 
         # ---------- 파라미터 ----------
         self.declare_parameter("port", "auto")
+
+        # port:"auto" 일 때 가장 먼저 볼 udev 심볼릭 링크 목록.
+        # setup.sh 가 /dev/t870_mcu 를 만든다. 다른 이름을 쓰면 여기에 적는다.
+        self.declare_parameter("port_symlinks", ["/dev/t870_mcu"])
+
+        # 자동 탐색이 실패했을 때 시도할 포트. 비워두는 것이 기본이다.
+        # ★ 예전에는 /dev/ttyACM0 을 무작정 열었는데, 거기 GPS 가 앉아 있으면
+        #   GPS 포트에 구동 명령을 쏘게 된다. 이제는 명시할 때만 시도한다.
+        self.declare_parameter("fallback_port", "")
+
         self.declare_parameter("baud", 115200)
         self.declare_parameter("send_hz", 10.0)
         self.declare_parameter("drive_timeout_s", 0.5)
@@ -152,10 +207,25 @@ class McuBridge(Node):
         self.declare_parameter("coasting_policy", "last_direction")
 
         # ---------- 급정거 ----------
-        # /mcu_stop=true 일 때 보낼 시리얼 명령.
-        # v28 에는 램프를 건너뛰는 즉시정지 명령이 아직 없어 기본값은 "1.00"(램프 정지).
-        # 펌웨어에 즉시정지(다이내믹 브레이킹) 명령을 추가하면 여기만 바꾸면 된다.
-        self.declare_parameter("estop_serial_command", "1.00")
+        #
+        # ★ 제동 명령(B)은 "상승 에지에 1회"만 보낸다. 반복 전송 금지.
+        #   펌웨어 requestBrake() 는 호출될 때마다 제동 펄스 타이머를 다시
+        #   찍는다. 전송 주기(100ms)가 BRAKE_PULSE_MS(150ms)보다 짧으므로
+        #   매 주기 보내면 펄스가 끝나지 않고 역토크가 유지되어 차가 뒤로 간다.
+        #
+        # 급정거가 걸린 순간 1회 보낼 명령. v29+ 펌웨어의 다이내믹 브레이킹.
+        self.declare_parameter("estop_serial_command", "B")
+
+        # 제동 이후 정지를 유지하며 매 주기 반복할 명령.
+        # 펌웨어 워치독(2초)을 먹이는 역할도 겸한다.
+        self.declare_parameter("estop_hold_command", "1.00")
+
+        # 아직 굴러가고 있을 때를 대비한 제동 재시도 간격 [초].
+        # 0 이면 재시도하지 않는다. 반드시 펌웨어 BRAKE_PULSE_MS(0.15초)보다
+        # 커야 한다. 이미 정지해 있으면 펌웨어가 역토크 없이 넘긴다
+        # (BRAKE_OK,ALREADY_STOPPED).
+        self.declare_parameter("estop_repeat_s", 0.5)
+
         # 급정거 신호 유효시간. 이보다 오래되면 해제로 본다.
         self.declare_parameter("stop_timeout_s", 0.5)
 
@@ -171,17 +241,24 @@ class McuBridge(Node):
         # port: "auto" 면 USB 장치 정보로 아두이노를 직접 찾는다.
         #       고정하려면 "/dev/ttyACM1" 처럼 경로를 직접 넣으면 된다.
         port_param = str(gp("port")).strip()
+        self.port_symlinks = [str(v) for v in (gp("port_symlinks") or [])]
+        self.fallback_port = str(gp("fallback_port")).strip()
         if port_param.lower() in ("auto", "", "none"):
-            found = find_arduino_port(self.get_logger())
+            self.auto_port = True
+            found = find_arduino_port(self.get_logger(), self.port_symlinks)
             if found:
                 self.port = found
                 self.get_logger().info("포트 자동 탐색: %s" % found)
-            else:
-                self.port = "/dev/ttyACM0"
+            elif self.fallback_port:
+                self.port = self.fallback_port
                 self.get_logger().warn(
-                    "아두이노를 못 찾았다. /dev/ttyACM0 으로 시도한다. "
-                    "USB 연결을 확인하거나 port:= 로 직접 지정하라.")
-            self.auto_port = True
+                    "아두이노를 못 찾았다. fallback_port=%s 로 시도한다."
+                    % self.fallback_port)
+            else:
+                self.port = ""
+                self.get_logger().warn(
+                    "아두이노를 못 찾았다. 연결될 때까지 계속 재탐색한다. "
+                    "(./setup.sh 를 한 번 실행하면 /dev/t870_mcu 로 고정된다)")
         else:
             self.port = port_param
             self.auto_port = False
@@ -206,6 +283,8 @@ class McuBridge(Node):
         self.telemetry_timeout = float(gp("telemetry_timeout_s"))
         self.coasting_policy = str(gp("coasting_policy")).lower()
         self.estop_cmd = str(gp("estop_serial_command")).strip()
+        self.estop_hold_cmd = str(gp("estop_hold_command")).strip()
+        self.estop_repeat_s = float(gp("estop_repeat_s"))
         self.stop_timeout = float(gp("stop_timeout_s"))
         self.cpm = float(gp("counts_per_meter"))
         self.wheelbase = float(gp("wheelbase_m"))
@@ -218,6 +297,13 @@ class McuBridge(Node):
             raise ValueError("wheel_timeout_policy must be hold_last or center")
         if self.coasting_policy not in ("last_direction", "drop"):
             raise ValueError("coasting_policy must be last_direction or drop")
+        if not self.estop_hold_cmd:
+            raise ValueError("estop_hold_command 는 비울 수 없다 (워치독 급식용)")
+        if 0.0 < self.estop_repeat_s < BRAKE_PULSE_GUARD_S:
+            raise ValueError(
+                "estop_repeat_s 가 %.2f 초보다 작으면 제동 펄스가 끝나지 않아 "
+                "역주행한다. 0(재시도 없음) 또는 %.2f 이상으로 둘 것."
+                % (BRAKE_PULSE_GUARD_S, BRAKE_PULSE_GUARD_S))
         if self.max_deg <= 0:
             raise ValueError("max_steer_deg must be > 0")
         self.ms_per_deg = self.steer_limit_ms / self.max_deg
@@ -247,6 +333,7 @@ class McuBridge(Node):
         self.hard_stop_active = False   # 실제 적용 중인지
         self.ros_estop_asserted = False
         self.estop_latched = False
+        self._brake_pulse_at = None     # 마지막 제동 송신 시각 (None = 미발사)
         self.firmware_fault = 0
         self.firmware_fault_text = ""
 
@@ -268,35 +355,42 @@ class McuBridge(Node):
         self.declare_parameter("input_drive_topic", "/mcu/cmd_drive")
         self.declare_parameter("input_wheel_topic", "/mcu/cmd_wheel")
         self.declare_parameter("input_stop_topic", "/mcu/cmd_stop")
-        _dt = str(self.get_parameter("input_drive_topic").value)
-        _wt = str(self.get_parameter("input_wheel_topic").value)
+        self.in_drive_topic = str(self.get_parameter("input_drive_topic").value)
+        self.in_wheel_topic = str(self.get_parameter("input_wheel_topic").value)
         _st = str(self.get_parameter("input_stop_topic").value)
-        self.sub_drive = self.create_subscription(Float32, _dt, self.cb_drive, 10)
-        self.sub_wheel = self.create_subscription(Int32, _wt, self.cb_wheel, 10)
-        self.sub_estop = self.create_subscription(Bool, "/estop_lock", self.cb_estop, 10)
+        self.sub_drive = self.create_subscription(
+            Float32, self.in_drive_topic, self.cb_drive, 10)
+        self.sub_wheel = self.create_subscription(
+            Int32, self.in_wheel_topic, self.cb_wheel, 10)
+        self.declare_parameter("estop_topic", "/estop_lock")
+        _et = str(self.get_parameter("estop_topic").value)
+        self.sub_estop = self.create_subscription(Bool, _et, self.cb_estop, 10)
         self.sub_stop = self.create_subscription(Bool, _st, self.cb_stop, 10)
 
         # ---------- 발행 토픽 (전부 파라미터) ----------
-        # 기본값은 카메라팀이 이미 쓰고 있는 이름 규약을 따른다.
-        # 그쪽 브릿지를 이 노드로 교체해도 구독 코드를 안 고쳐도 되게 하기 위함.
+        # ★ 기본값을 전부 /mcu/ 네임스페이스로 옮겼다.
+        #   예전 기본값은 /rpm, /inpulse, /steer_angle 처럼 최상위 이름이라
+        #   yaml 없이 노드만 띄우면 다른 팀 토픽과 이름이 겹쳤다.
+        #   팀에 배포하는 코드의 기본값이 남의 이름을 점유하면 안 된다.
+        #   (/odom 만 예외 — Nav2 표준 이름이라 그대로 둔다)
         pubdefs = [
-            ("pub_topic_encoder",     "/inpulse"),
-            ("pub_topic_steer_angle", "/steer_angle"),
-            ("pub_topic_rpm",         "/rpm"),
-            ("pub_topic_steer_a0",    "/steer_a0"),
-            ("pub_topic_steer_ms",    "/steer_position_ms"),
-            ("pub_topic_speed_mps",   "/vehicle/speed_mps"),
-            ("pub_topic_speed_kph",   "/vehicle/speed_kph"),
-            ("pub_topic_distance",    "/vehicle/distance_m"),
-            ("pub_topic_speed_valid", "/vehicle/speed_valid"),
-            ("pub_topic_connected",   "/arduino/connected"),
-            ("pub_topic_status",      "/arduino/status"),
-            ("pub_topic_raw_status",  "/arduino/raw_status"),
-            ("pub_topic_feedback_valid", "/arduino/feedback_valid"),
-            ("pub_topic_fault",       "/arduino/fault"),
-            ("pub_topic_fault_text",  "/arduino/fault_text"),
-            ("pub_topic_ready",       "/vehicle_interface/ready"),
-            ("pub_topic_iface_status","/vehicle_interface/status"),
+            ("pub_topic_encoder",     "/mcu/encoder"),
+            ("pub_topic_steer_angle", "/mcu/steer_deg"),
+            ("pub_topic_rpm",         "/mcu/rpm"),
+            ("pub_topic_steer_a0",    "/mcu/steer_a0"),
+            ("pub_topic_steer_ms",    "/mcu/steer_ms"),
+            ("pub_topic_speed_mps",   "/mcu/speed_mps"),
+            ("pub_topic_speed_kph",   "/mcu/speed_kph"),
+            ("pub_topic_distance",    "/mcu/distance_m"),
+            ("pub_topic_speed_valid", "/mcu/speed_valid"),
+            ("pub_topic_connected",   "/mcu/connected"),
+            ("pub_topic_status",      "/mcu/fw_state"),
+            ("pub_topic_raw_status",  "/mcu/raw_status"),
+            ("pub_topic_feedback_valid", "/mcu/telemetry_ok"),
+            ("pub_topic_fault",       "/mcu/fault"),
+            ("pub_topic_fault_text",  "/mcu/fault_text"),
+            ("pub_topic_ready",       "/mcu/ready"),
+            ("pub_topic_iface_status","/mcu/iface_state"),
             ("pub_topic_estop",       "/mcu/estop_latched"),
             ("pub_topic_hard_stop",   "/mcu/hard_stop_active"),
             ("pub_topic_odom",        "/odom"),
@@ -305,8 +399,9 @@ class McuBridge(Node):
             self.declare_parameter(name, default)
         pt = lambda n: str(self.get_parameter(n).value)
 
-        # 구버전 이름으로도 같이 발행할지 (/drive, /wheel, /arduino/telemetry_ok)
-        self.declare_parameter("publish_legacy_names", True)
+        # 구버전 이름(/drive, /wheel, /arduino/telemetry_ok)으로도 같이 발행할지.
+        # ★ 기본 false. 최상위 이름이라 다른 팀과 충돌할 수 있다.
+        self.declare_parameter("publish_legacy_names", False)
         self.legacy = bool(self.get_parameter("publish_legacy_names").value)
 
         self.pub_conn = self.create_publisher(Bool, pt("pub_topic_connected"), 10)
@@ -345,7 +440,9 @@ class McuBridge(Node):
         self.pub_odom = self.create_publisher(Odometry, pt("pub_topic_odom"), 10)
         self.tf_bc = TransformBroadcaster(self) if (TF_OK and self.publish_tf) else None
 
-        self.reset_srv = self.create_service(Trigger, "/mcu/reset_estop", self.cb_reset_estop)
+        self.declare_parameter("reset_estop_service", "/mcu/reset_estop")
+        _rs = str(self.get_parameter("reset_estop_service").value)
+        self.reset_srv = self.create_service(Trigger, _rs, self.cb_reset_estop)
 
         self.rx_thread = threading.Thread(target=self.rx_loop, daemon=True)
         self.rx_thread.start()
@@ -353,11 +450,14 @@ class McuBridge(Node):
         self.conn_timer = self.create_timer(0.2, self.conn_tick)
 
         self.get_logger().info(
-            "mcu_bridge v2: %s @ %d, send=%.1fHz, drive_timeout=%.2fs, "
-            "wheel_timeout=%.2fs, 1deg=%.2fms, 직진보정=%+.1f도, cpm=%s"
-            % (self.port, self.baud, send_hz, self.drive_timeout,
+            "mcu_bridge v3: %s @ %d, send=%.1fHz, drive_timeout=%.2fs, "
+            "wheel_timeout=%.2fs, 1deg=%.2fms, 직진보정=%+.1f도, cpm=%s, "
+            "급정거=%s(1회) → %s(반복), 재시도=%s"
+            % (self.port or "탐색 중", self.baud, send_hz, self.drive_timeout,
                self.wheel_timeout, self.ms_per_deg, self.steer_offset,
-               ("%.2f" % self.cpm) if self.cpm > 0 else "미측정(odom 비활성)")
+               ("%.2f" % self.cpm) if self.cpm > 0 else "미측정(odom 비활성)",
+               self.estop_cmd, self.estop_hold_cmd,
+               ("%.2fs" % self.estop_repeat_s) if self.estop_repeat_s > 0 else "없음")
         )
         if self.cpm <= 0:
             self.get_logger().warn(
@@ -373,7 +473,8 @@ class McuBridge(Node):
         now = time.monotonic()
         if stage is None:
             self.get_logger().error(
-                "invalid /mcu_drive=%r; 허용값 -1,0,1,2,3. 거부하고 정지." % msg.data)
+                "invalid drive=%r (%s); 허용값 -1,0,1,2,3. 거부하고 정지."
+                % (msg.data, self.in_drive_topic))
             self.cmd_stage = 0
             self.have_drive = True
             self.last_drive_rx = now
@@ -387,7 +488,8 @@ class McuBridge(Node):
         deg = int(msg.data)
         if not valid_wheel_deg(deg, self.max_deg):
             self.get_logger().error(
-                "invalid /mcu_wheel=%d; 허용범위 ±%d. 거부." % (deg, int(self.max_deg)))
+                "invalid wheel=%d (%s); 허용범위 ±%d. 거부."
+                % (deg, self.in_wheel_topic, int(self.max_deg)))
             return
         if deg != self.cmd_deg:
             self.wheel_dirty = True
@@ -427,6 +529,7 @@ class McuBridge(Node):
             response.message = "reset denied: Arduino fault=%s" % self.firmware_fault_text
             return response
         self.estop_latched = False
+        self._brake_pulse_at = None     # 다음 E-Stop 때 제동을 다시 1회 발사
         self.get_logger().info("E-stop latch cleared")
         response.success = True
         response.message = "E-stop latch cleared; fresh ROS commands are still required"
@@ -445,11 +548,16 @@ class McuBridge(Node):
         # 자동 모드면 재연결 때마다 다시 찾는다.
         # USB 를 뽑았다 꽂으면 번호가 바뀔 수 있다.
         if self.auto_port:
-            found = find_arduino_port(None)
+            found = find_arduino_port(None, self.port_symlinks)
             if found and found != self.port:
                 self.get_logger().info(
-                    "포트 변경 감지: %s -> %s" % (self.port, found))
+                    "포트 확정: %s -> %s" % (self.port or "(없음)", found))
                 self.port = found
+            elif not found and not self.fallback_port:
+                self.port = ""      # 아직 안 꽂혔다. 다음 주기에 다시 찾는다.
+
+        if not self.port:
+            return
 
         try:
             ser = serial.Serial(self.port, self.baud, timeout=0.1)
@@ -477,6 +585,7 @@ class McuBridge(Node):
         self.last_wheel_rx = 0.0
         self.prev_count = None          # 엔코더 기준점 재설정
         self.last_motion_dir = 0
+        self._brake_pulse_at = None     # 제동 에지 재무장
         self.get_logger().info(
             "포트 열림: %s — 아두이노 리셋 %.1fs 대기" % (self.port, self.reset_wait))
 
@@ -555,6 +664,37 @@ class McuBridge(Node):
     # 송신
     # ============================================================
 
+    def _emit_brake(self, now):
+        """급정거 명령 송신 — 제동은 1회, 이후에는 정지 유지만.
+
+        ★ 이 함수가 존재하는 이유
+          펌웨어 requestBrake() 는 호출될 때마다 brakeStartMs 를 다시 찍는다.
+          updateBrake() 는 (now - brakeStartMs >= BRAKE_PULSE_MS) 일 때만
+          펄스를 끝내는데, 브릿지가 매 주기(100ms) B 를 보내면 그 조건이
+          영원히 성립하지 않는다. 결과는 PWM 120 역토크가 계속 걸린 상태 —
+          즉 급정거를 걸었는데 차가 뒤로 간다.
+
+          그래서 제동 명령은 상승 에지에 한 번만 보내고, 그 뒤에는
+          estop_hold_command("1.00")만 반복해 워치독을 먹인다.
+
+          estop_repeat_s > 0 이면 그 간격으로 제동을 재시도한다. 아직
+          굴러가고 있을 때를 위한 것이고, 이미 서 있으면 펌웨어가
+          BRAKE_OK,ALREADY_STOPPED 로 넘겨 역토크를 걸지 않는다.
+        """
+        if self._brake_pulse_at is None:
+            fire = True                                   # 상승 에지 — 첫 발
+        elif self.estop_repeat_s > 0.0:
+            fire = (now - self._brake_pulse_at) >= self.estop_repeat_s
+        else:
+            fire = False
+
+        if fire:
+            if self.send_line(self.estop_cmd):
+                self._brake_pulse_at = now
+            return
+
+        self.send_line(self.estop_hold_cmd)
+
     def tx_tick(self):
         if self.conn_state != CONN_READY:
             return
@@ -568,7 +708,7 @@ class McuBridge(Node):
         if stop_fresh != self.hard_stop_active:
             self.hard_stop_active = stop_fresh
         if stop_fresh:
-            self.send_line(self.estop_cmd)
+            self._emit_brake(now)
             m = Bool(); m.data = True; self.pub_hard_stop.publish(m)
             if self.status_period > 0 and now - self.last_status_req >= self.status_period:
                 if self.send_line("S"):
@@ -578,23 +718,29 @@ class McuBridge(Node):
         m = Bool(); m.data = False; self.pub_hard_stop.publish(m)
 
         if self.estop_latched:
-            stage_to_send = 0
-        elif drive_fresh:
-            stage_to_send = self.cmd_stage
+            # E-Stop 은 물리 비상이다. 급정거와 같은 경로로 제동을 쓴다.
+            # (예전에는 감속 램프 정지만 나갔다)
+            self._emit_brake(now)
         else:
-            stage_to_send = 0
-            if self.have_drive and not self.drive_timeout_warned:
-                self.get_logger().warn(
-                    "/mcu_drive 타임아웃 → 구동 정지 (조향은 영향 없음)")
-                self.drive_timeout_warned = True
+            # 급정거·래치가 모두 없으면 다음 급정거를 위해 에지를 재무장한다.
+            self._brake_pulse_at = None
 
-        # 펌웨어 워치독(2초) 급식. 매 주기 전송.
-        self.send_line(drive_serial_command(stage_to_send))
+            if drive_fresh:
+                stage_to_send = self.cmd_stage
+            else:
+                stage_to_send = 0
+                if self.have_drive and not self.drive_timeout_warned:
+                    self.get_logger().warn(
+                        "구동 명령 타임아웃 → 정지 (조향은 영향 없음)")
+                    self.drive_timeout_warned = True
+
+            # 펌웨어 워치독(2초) 급식. 매 주기 전송.
+            self.send_line(drive_serial_command(stage_to_send))
 
         # 조향 타임아웃은 구동을 절대 멈추지 않는다.
         if self.have_wheel and not wheel_fresh and not self.wheel_timeout_warned:
             self.get_logger().warn(
-                "/mcu_wheel 타임아웃 → policy=%s; 구동은 독립적으로 계속"
+                "조향 명령 타임아웃 → policy=%s; 구동은 독립적으로 계속"
                 % self.wheel_timeout_policy)
             self.wheel_timeout_warned = True
             if self.wheel_timeout_policy == "center" and self.cmd_deg != 0:
