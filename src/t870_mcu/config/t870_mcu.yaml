@@ -69,7 +69,10 @@ mcu_bridge:
     estop_serial_command: "B"       # 급정거 순간 1회
     estop_hold_command: "1.00"      # 이후 정지 유지 + 워치독 급식
     estop_repeat_s: 0.5             # 제동 재시도 간격. 0=재시도 없음
-                                    # 펌웨어 BRAKE_PULSE_MS(0.15s)보다 커야 함
+                                    # 펌웨어 BRAKE_MAX_MS(0.30s)보다 커야 함
+                                    # ⚠ 더 좁히지 말 것 — 제동 방향이 "마지막
+                                    #   명령 방향" 기준이라, 멈춘 뒤 뒤로 밀리면
+                                    #   다음 펄스가 후진을 가속한다
     stop_timeout_s: 0.5
 
     center_steer_on_connect: true
@@ -130,11 +133,59 @@ mcu_manager:
     # 구동: 고정 우선순위 (앞이 이김)
     drive_priority: [lidar, camera, gps]
 
-    # 조향: 주차 모드에서만 라이다, 그 외 카메라
+    # ========================================================
+    # 대회 구간 모드 — 2026-08-28 틀 (문자열 미확정)
+    #
+    # ⚠ 아직 팀 확정 전이다. 이름이 바뀌면 known_modes 와
+    #   wheel_owner_overrides 두 곳만 고치면 된다. 코드 수정 불필요.
+    #
+    # 구간 순서 (MCU 정리.txt 기준)
+    #   1  START            시작            DR + 카메라
+    #   2  SLOPE            경사로          DR + GPS + 카메라, 정지선 3초
+    #   3  CRANK            직각(굴절)코스   카메라 + GPS + DR
+    #   4  INTERSECTION_1   교차로1 직진     waypoint, 신호
+    #   5  S_COURSE         곡선코스+장애물  라이다 우선(폴백 미정)
+    #   6  INTERSECTION_2   교차로2 직진     + T자 진입 우회전(GPS)
+    #   7  T_PARK           T자주차         라이다 또는 GPS
+    #   8  INTERSECTION_3   교차로3 좌회전
+    #   9  ACCELERATION     가속구간        라이다 우회 금지
+    #   10 PARALLEL_PARK    평행주차        T자와 동일
+    #   11 FINISH           종료            신호수(?)
+    #
+    #   IDLE               시동 직후 기본값
+    #   SUDDEN_STOP        돌발 — 모드가 아니라 이벤트일 가능성이 높다.
+    #                      /<팀>_stop 으로 이미 처리되므로 모드는 예비용
+    # ========================================================
+    known_modes:
+      - "IDLE"
+      - "START"
+      - "SLOPE"
+      - "CRANK"
+      - "INTERSECTION_1"
+      - "S_COURSE"
+      - "INTERSECTION_2"
+      - "T_PARK"
+      - "INTERSECTION_3"
+      - "ACCELERATION"
+      - "PARALLEL_PARK"
+      - "FINISH"
+      - "SUDDEN_STOP"
+
+    # known_modes 에 없는 모드가 오면:
+    #   keep    = 직전 모드 유지 + ERROR 로그 (권장)
+    #   default = 기본 소유자로 (조용히 넘어가던 기존 동작)
+    unknown_mode_policy: "keep"
+
+    # ---------- 조향 권한 ----------
+    # 기본은 카메라. 아래 모드에서만 다른 팀이 가져간다.
+    # 지금은 주차 두 개만 확정. S_COURSE 는 팀 결정 대기 중이라 비워뒀다.
     wheel_owner_default: "camera"
     wheel_owner_overrides:
       - "T_PARK:lidar"
       - "PARALLEL_PARK:lidar"
+      # 아래는 확정되면 주석을 풀 것 ------------------------
+      # - "S_COURSE:lidar"        # 라이다가 장애물 우회 조향
+      # - "ACCELERATION:camera"   # 기본과 같아 사실 불필요
     wheel_failsafe_mode: "center"
 
     # 급정거 (래치 아님)
