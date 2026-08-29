@@ -22,7 +22,7 @@ ROS 2 Jazzy / Ubuntu 24.04 / Arduino Mega 2560 (115200 baud)
 새 파일을 넣고 빌드하고 정합성 감사까지 돌린다.
 
 ```bash
-cd ~/Downloads && unzip -o T870_MCU_0830_팀배포_v12.zip
+cd ~/Downloads && unzip -o T870_MCU_0830_팀배포_v13.zip
 cd T870_MCU_0830
 ./설치.sh              # 미리보기 — 아무것도 바꾸지 않는다
 ./설치.sh --apply      # 실제 설치
@@ -263,6 +263,7 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 | `tools/audit.py` | 소스 ↔ yaml 정합성 감사 (ROS 불필요) |
 | `tools/drive_wasd.py` | 키보드 수동 조종 |
 | `tools/check_ports.py` | 어느 포트가 뭔지 확인 |
+| `tools/serial_console.py` | MCU 에 명령 직접 입력 (`A600` 조향끝값, `AR1` 안티롤백, `B` 급제동). ROS 불필요 |
 | `tools/odom_calib.py` | counts_per_meter 검증 (ROS) |
 | `tools/odom_compare.py` | 줄자↔엔코더↔우리 거리↔`/odom` 4중 비교 (누구 문제인지 갈라냄) |
 | `tools/measure.py` | counts_per_meter 실측 (시리얼 직결) |
