@@ -59,6 +59,17 @@ class ManagerNode(Node):
         self.declare_parameter("wheel_owner_default", "camera")
         self.declare_parameter(
             "wheel_owner_overrides", ["T_PARK:lidar", "PARALLEL_PARK:lidar"])
+
+        # 대회 구간 모드 문자열 화이트리스트.
+        # 여기 없는 모드가 /vehicle_mode 로 오면 ERROR 를 찍고 무시한다.
+        # (조용히 기본 소유자로 넘어가면 주차 구간 오타를 못 잡는다)
+        # 비워두면 검증하지 않는다.
+        self.declare_parameter("known_modes", [])
+
+        # 알 수 없는 모드가 왔을 때:
+        #   keep    = 직전 모드 유지 (권장. 갑자기 조향 권한이 바뀌지 않는다)
+        #   default = 기본 소유자로 (기존 동작)
+        self.declare_parameter("unknown_mode_policy", "keep")
         # 권한 소스가 값을 안 줄 때: center(0도) | hold_last
         self.declare_parameter("wheel_failsafe_mode", "center")
 
@@ -135,8 +146,14 @@ class ManagerNode(Node):
 
         self.inputs = InputManager(self.source_names)
         self.drive_sel = PrioritySelector(gp("drive_priority"), self.source_names)
+        self.known_modes = [str(m).strip().upper() for m in (gp("known_modes") or [])]
+        self.unknown_mode_policy = str(gp("unknown_mode_policy")).strip().lower()
+        if self.unknown_mode_policy not in ("keep", "default"):
+            raise ValueError("unknown_mode_policy 는 keep 또는 default")
         self.wheel_gate = WheelGate(
-            gp("wheel_owner_default"), gp("wheel_owner_overrides"), self.source_names)
+            gp("wheel_owner_default"), gp("wheel_owner_overrides"),
+            self.source_names, self.known_modes)
+        self.unknown_mode_seen = ""     # 같은 오타를 한 번만 찍기 위한 기록
         self.safety = SafetyManager(
             drive_validation_mode=gp("drive_validation_mode"),
             drive_allowed_values=gp("drive_allowed_values"),
@@ -226,9 +243,10 @@ class ManagerNode(Node):
 
         self.get_logger().info(
             "mcu_manager v3: 구동우선순위=%s 조향기본=%s 조향override=%s "
-            "정지소스=%s %.0fHz"
+            "정지소스=%s %.0fHz 모드검증=%s"
             % (self.drive_sel.priority, self.wheel_gate.default_owner,
-               self.wheel_gate.overrides, self.stop_sources, publish_hz))
+               self.wheel_gate.overrides, self.stop_sources, publish_hz,
+               ("%d개" % len(self.known_modes)) if self.known_modes else "없음"))
 
     # ============================================================
     # 콜백
@@ -318,6 +336,22 @@ class ManagerNode(Node):
 
     def _cb_mode(self, msg):
         new_mode = str(msg.data).strip().upper()
+
+        # ---- 모드 문자열 검증 ----
+        # 오타 하나가 조향 권한을 통째로 바꾼다. 조용히 넘기지 않는다.
+        if not self.wheel_gate.is_known(new_mode):
+            if new_mode != self.unknown_mode_seen:
+                self.get_logger().error(
+                    "알 수 없는 모드 '%s' — known_modes 에 없다. "
+                    "policy=%s. 허용: %s"
+                    % (new_mode, self.unknown_mode_policy,
+                       ", ".join(self.known_modes)))
+                self.unknown_mode_seen = new_mode
+            if self.unknown_mode_policy == "keep":
+                return                      # 직전 모드 유지
+        else:
+            self.unknown_mode_seen = ""
+
         if new_mode != self.mode:
             old_owner = self.wheel_gate.owner(self.mode)
             new_owner = self.wheel_gate.owner(new_mode)

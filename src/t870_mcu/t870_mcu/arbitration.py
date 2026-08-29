@@ -171,7 +171,7 @@ class WheelGate:
     """
 
     def __init__(self, default_owner: str, override_entries: Iterable[str],
-                 known_sources: Iterable[str]):
+                 known_sources: Iterable[str], known_modes: Iterable[str] = ()):
         known = set(known_sources) | {CENTER_SOURCE, NO_SOURCE}
         self.default_owner = str(default_owner).strip().lower()
         if self.default_owner not in known:
@@ -190,6 +190,30 @@ class WheelGate:
             if owner not in known:
                 raise ValueError("wheel_owner_overrides 에 알 수 없는 소스: %s" % owner)
             self.overrides[mode.strip().upper()] = owner
+
+        # ---- 모드 문자열 화이트리스트 ----
+        #
+        # ★ 이게 없으면 오타가 조용히 넘어간다.
+        #   "T_PARK" 를 "TPARK" 로 발행하면 override 에 안 걸려 기본 소유자
+        #   (카메라)가 조향을 가져간다. 에러도 경고도 없다. 주차 구간에서
+        #   이게 나면 주차 자체가 실패하는데 원인을 찾기가 매우 어렵다.
+        #
+        # known_modes 가 비어 있으면 검증하지 않는다 (기존 동작).
+        self.known_modes = set(
+            str(m).strip().upper() for m in known_modes if str(m).strip())
+
+        unknown_override = [m for m in self.overrides
+                            if self.known_modes and m not in self.known_modes]
+        if unknown_override:
+            raise ValueError(
+                "wheel_owner_overrides 의 모드가 known_modes 에 없다: %s"
+                % sorted(unknown_override))
+
+    def is_known(self, mode: str) -> bool:
+        """known_modes 에 있는 모드인가. 목록이 비어 있으면 항상 True."""
+        if not self.known_modes:
+            return True
+        return str(mode).strip().upper() in self.known_modes
 
     def owner(self, mode: str) -> str:
         return self.overrides.get(str(mode).strip().upper(), self.default_owner)

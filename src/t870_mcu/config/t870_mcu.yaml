@@ -80,6 +80,11 @@ mcu_bridge:
     reconnect_delay_s: 1.0
     telemetry_timeout_s: 2.0
     latch_on_firmware_fault: true
+
+    # /estop_lock 의 true 를 "살아있는 주장" 으로 볼 유효시간 [초].
+    # ★ 없으면 복구 불가 상태가 생긴다 — true 를 한 번 쏘고 죽은 노드 때문에
+    #   래치 해제가 영구히 거부된다. 래치 자체는 그대로고, 해제 허용 여부만 본다.
+    estop_assert_timeout_s: 1.0
     coasting_policy: "last_direction"
 
     # ---------- 발행 토픽 ----------
@@ -99,6 +104,9 @@ mcu_bridge:
     pub_topic_connected: "/mcu/connected"
     pub_topic_status: "/mcu/fw_state"
     pub_topic_raw_status: "/mcu/raw_status"
+    # STATUS 가 아닌 펌웨어 출력 (MCU_BOOT / BRAKE_OK / BRAKE_DONE / CAL_* ...)
+    # ★ 예전에는 전부 버려서, ROS 로 띄우면 제동 결과를 볼 방법이 없었다.
+    pub_topic_fw_message: "/mcu/fw_message"
     pub_topic_feedback_valid: "/mcu/telemetry_ok"
     pub_topic_fault: "/mcu/fault"
     pub_topic_fault_text: "/mcu/fault_text"
@@ -112,15 +120,67 @@ mcu_bridge:
     # 최상위 이름이라 다른 팀과 충돌할 수 있다. 기본 false 유지.
     publish_legacy_names: false
 
-    # 2026-08-26 실측: 10m ×3회, 평균 533.1 (편차 15.2%)
-    # 1카운트 = 1.9mm, 바퀴 1회전 = 436카운트 (둘레 0.817m)
-    # ⚠ 편차가 커서 재측정 권장. 값이 바뀌면 여기만 고치면 된다.
+    # ★ 2026-08-29 재측정 — 아두이노 단독 스케치 (ROS 없이)
+    #     955 카운트 / 4.78 m (2단, 10초, 하중 실린 상태)
+    #     내부 검증: 평균속도 0.455 m/s (2단 문서값 0.526 과 정합)
+    #                정속구간 99.6 카운트/s ÷ 0.5 m/s = 199  (총합과 일치)
+    #
+    #   1카운트 = 5.01mm,  바퀴 1회전 = 163카운트 (둘레 0.817m 가정)
+    #
+    #   이전 값 533.1 은 틀렸다. odom 이 실제의 37.5% 만 보고했다
+    #   (실제 10m → odom 3.75m).
+    #
+    #   ⚠ 1회 측정이다. 2회 더 재고 잭업 회전수로 교차검증할 것.
+    #   ⚠ 하중이 크게 바뀌면 타이어 눌림이 달라져 이 값도 변한다.
     counts_per_meter: 199.8
     wheelbase_m: 0.73
     encoder_signed: false
     odom_frame: "odom"
     base_frame: "base_link"
+
+    # TF(odom -> base_link)를 이 노드가 발행할지.
+    # ★ GPS팀이나 다른 노드가 같은 TF 를 발행하면 충돌한다.
+    #   TF 트리에 같은 부모-자식 링크를 두 곳에서 쏘면 값이 번갈아 튄다.
+    #   융합 노드(robot_localization 등)를 쓸 계획이면 여기를 false 로 두고
+    #   그쪽이 TF 를 담당하게 해야 한다.
     publish_tf: true
+
+    # ---------- 오도메트리 신뢰도 (공분산) ----------
+    #
+    # ★ 0828 추가. 그 전에는 covariance 가 전부 0 이었다.
+    #   0 은 "오차가 없다"는 뜻이라, EKF 로 융합하면 필터가 이 값을 절대
+    #   신뢰하고 GPS 를 무시한다. 우리 heading 은 조향각을 시간으로 추측한
+    #   값이라 가장 못 믿을 값인데 그걸 완벽하다고 선언하고 있었다.
+    #
+    # ⚠ 아래는 잠정값이다. 실측 후 조정할 것.
+    #   dist 0.15 는 counts_per_meter 실측 편차 15.2% 에서 왔다.
+    #   yaw 쪽은 조향각을 측정하지 못해 근거 없는 보수적 추정이다.
+    #
+    # 이 값으로 나오는 대략적인 불확실도:
+    #   직진 5m   위치 1σ 0.08m,  방위 1σ 0.29도
+    #   직진 20m  위치 1σ 0.25m,  방위 1σ 0.57도
+    #   90도 선회 1회  방위 1σ 6.9도,  위치 1σ 0.28m
+    odom_dist_error_ratio: 0.15     # 이동 1m 당 위치 오차 비율
+    odom_yaw_error_ratio: 0.5       # 회전 1rad 당 방위 오차 비율
+    odom_yaw_drift_per_m: 0.010     # 직진 1m 당 방위 드리프트 [rad]
+    odom_max_pos_var: 25.0          # 위치 분산 상한 [m^2] (=5m)
+    odom_max_yaw_var: 1.0           # 방위 분산 상한 [rad^2] (=1rad)
+    odom_vel_error_ratio: 0.15
+    odom_vel_error_floor: 0.02      # [m/s]
+
+    # 엔코더가 앞축(조향축)에 있어 선회 시 뒤축보다 더 돈다.
+    # d_rear = d_front x cos(조향각) 으로 환산할지.
+    #
+    # ★ 조향각은 측정값이 아니라 시간 기반 추정이다.
+    #   직진 중인데 steer_ms 가 440(27도)로 남아 있으면 cos(27도)=0.891,
+    #   즉 거리가 11% 짧게 나온다.
+    #   거리가 실제와 안 맞으면 false 로 두고 다시 재볼 것.
+    #   AS5600 으로 실제 각도를 재게 되면 true 가 정답이다.
+    odom_steer_compensation: true
+
+    # 오도메트리 원점 재설정 서비스
+    #   ros2 service call /mcu/reset_odom std_srvs/srv/Trigger '{}'
+    reset_odom_service: "/mcu/reset_odom"
 
 
 # ============================================================
