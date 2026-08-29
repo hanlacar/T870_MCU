@@ -79,6 +79,7 @@ except ImportError:
 
 import serial
 
+from .diagnostics import check_subscriptions
 from .protocol import (
     parse_drive_stage,
     drive_serial_command,
@@ -455,6 +456,18 @@ class McuBridge(Node):
         self.sub_estop = self.create_subscription(
             Bool, self._estop_topic_name, self.cb_estop, 10)
         self.sub_stop = self.create_subscription(Bool, _st, self.cb_stop, 10)
+
+        #  타입·QoS 불일치는 에러 없이 메시지를 삼킨다. 주기적으로 확인한다.
+        self._sub_specs = [
+            (self.in_drive_topic, "std_msgs/msg/Float32", "구동 명령"),
+            (self.in_wheel_topic, "std_msgs/msg/Int32", "조향 명령"),
+            (_st, "std_msgs/msg/Bool", "급정거"),
+            (self._estop_topic_name, "std_msgs/msg/Bool", "비상정지"),
+        ]
+        self._diag_seen = set()
+        self.diag_timer = self.create_timer(
+            3.0,
+            lambda: check_subscriptions(self, self._sub_specs, self._diag_seen))
 
         # ---------- 발행 토픽 (전부 파라미터) ----------
         # ★ 기본값을 전부 /mcu/ 네임스페이스로 옮겼다.
