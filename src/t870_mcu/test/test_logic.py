@@ -423,3 +423,81 @@ def test_진단_reliability가_정수여도_동작한다():
     n = _Node({"/a": [info]})
     check_subscriptions(n, [("/a", "std_msgs/msg/Bool", "급정거")], set())
     assert len(n._log.msgs) == 1
+
+
+# ==========================================================
+# 엔코더 누적값 검증 (0829)
+#
+#  증상: 키보드로 전진하다 멈추면 /mcu/encoder 가 0 으로 초기화됐다.
+#  원인: STATUS 필드가 시리얼 노이즈로 깨지면 파서가 기본값 0 을 줬다.
+#        제동은 역토크 펄스라 노이즈가 가장 큰 순간이고, 그래서
+#        하필 "멈출 때마다" 초기화되는 것처럼 보였다.
+# ==========================================================
+from t870_mcu.protocol import encoder_sanity, parse_status
+
+GOOD = "STATUS,ACTIVE,NONE,251,363,100,12.34,457,120,120,440,7,14,1,0"
+
+
+def test_정상_STATUS_는_엔코더를_읽는다():
+    assert parse_status(GOOD)["encoder_count"] == 457
+
+
+def test_엔코더필드가_깨지면_0이_아니라_None():
+    #  예전에는 여기서 0 이 나왔다. 그게 "초기화" 증상의 원인이었다.
+    broken = "STATUS,ACTIVE,NONE,251,363,100,12.34,4x5,120,120,440"
+    assert parse_status(broken)["encoder_count"] is None
+
+
+def test_엔코더필드가_비어도_None():
+    empty = "STATUS,ACTIVE,NONE,251,363,100,12.34,,120,120,440"
+    assert parse_status(empty)["encoder_count"] is None
+
+
+def test_sanity_None은_거부():
+    ok, why = encoder_sanity(None, 100, 0.2, 2000.0)
+    assert not ok and "읽을 수 없다" in why
+
+
+def test_sanity_첫값은_무조건_받는다():
+    ok, _ = encoder_sanity(12345, None, 0.2, 2000.0)
+    assert ok
+
+
+def test_sanity_정상_주행은_통과():
+    #  0.5m/s, 199.8 counts/m → 0.2초에 약 20카운트
+    ok, _ = encoder_sanity(120, 100, 0.2, 2000.0)
+    assert ok
+
+
+def test_sanity_최고속의_두배도_통과():
+    #  실수로 정상 주행을 걸러내면 안 된다. 0.2초에 320카운트(=8m/s) 도 통과
+    ok, _ = encoder_sanity(420, 100, 0.2, 2000.0)
+    assert ok
+
+
+def test_sanity_말도안되는_점프는_거부():
+    #  필드가 밀려 steer_limit_ms(440) 같은 엉뚱한 값이 들어온 경우
+    ok, why = encoder_sanity(50000, 100, 0.2, 2000.0)
+    assert not ok and "튀었다" in why
+
+
+def test_sanity_0으로_떨어지는_것도_거부():
+    #  바로 이 증상. 누적 5000 에서 갑자기 0 은 물리적으로 불가능하다.
+    ok, why = encoder_sanity(0, 5000, 0.1, 2000.0)
+    assert not ok
+
+
+def test_sanity_후진_부호반전은_통과():
+    #  전진 누적 300 → 후진으로 바뀌며 조금 줄어드는 것은 정상
+    ok, _ = encoder_sanity(280, 300, 0.2, 2000.0)
+    assert ok
+
+
+def test_sanity_한계를_0으로_두면_검사를_끈다():
+    ok, _ = encoder_sanity(999999, 100, 0.1, 0.0)
+    assert ok
+
+
+def test_sanity_dt가_0이어도_안터진다():
+    ok, _ = encoder_sanity(150, 100, 0.0, 2000.0)
+    assert ok

@@ -108,7 +108,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--distance", type=float, default=0.0,
                     help="매번 같은 거리를 갈 때만 쓴다. 기본은 주행 후 입력")
-    ap.add_argument("--cpm", type=float, default=533.1,
+    ap.add_argument("--cpm", type=float, default=199.8,   # 0829 실측. 예전 기본값 533.1 은 폐기
                     help="현재 yaml 의 counts_per_meter (비교용)")
     ap.add_argument("--mcu-ns", default="/mcu")
     args = ap.parse_args()

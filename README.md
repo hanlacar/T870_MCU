@@ -22,8 +22,8 @@ ROS 2 Jazzy / Ubuntu 24.04 / Arduino Mega 2560 (115200 baud)
 새 파일을 넣고 빌드하고 정합성 감사까지 돌린다.
 
 ```bash
-cd ~/Downloads && unzip -o T870_MCU_0829_팀배포_v6.zip
-cd T870_MCU_0829
+cd ~/Downloads && unzip -o T870_MCU_0830_팀배포_v11.zip
+cd T870_MCU_0830
 ./설치.sh              # 미리보기 — 아무것도 바꾸지 않는다
 ./설치.sh --apply      # 실제 설치
 ```
@@ -183,6 +183,16 @@ S_COURSE  T_PARK  ACCEL  PARALLEL_PARK  OUT
 
 ---
 
+## 0830 동작 변경
+
+| 항목 | 전 | 후 | 왜 |
+|---|---|---|---|
+| `center_steer_on_connect` | `true` | **`false`** | 켜자마자 바퀴가 혼자 움직였다. 사람이 잡고 있으면 위험 |
+| 엔코더 파싱 실패 | 0 을 발행 | **발행 안 함 (직전 값 유지)** | 누적값에 0 이 튀어 "멈추면 초기화" 로 보였다 |
+| `encoder_max_counts_per_s` | 없음 | **2000.0** | 물리적으로 불가능한 점프를 걸러낸다. 0 이면 검사 끔 |
+
+---
+
 ## 실측값
 
 ```
@@ -206,7 +216,7 @@ wheel_odom 을 쓸 때: `encoder_m_per_tick = 1 / 199.8 = 0.005005`
 
 ## 펌웨어
 
-`firmware/T870_MCU_v36.ino` 를 Arduino IDE 로 업로드.
+`firmware/T870_MCU_v37.ino` 를 Arduino IDE 로 업로드.
 Board: **Arduino Mega or Mega 2560** / 115200 baud
 
 > **⚠ 펌웨어 업로드는 MCU 담당만 한다.** 서로 다른 버전이 올라가면
@@ -215,7 +225,7 @@ Board: **Arduino Mega or Mega 2560** / 115200 baud
 부팅 로그로 확인:
 
 ```
-MCU_BOOT,v36
+MCU_BOOT,v37
 ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 ```
 
@@ -229,6 +239,13 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 | 안티롤백 세기 | `ARP70` | 기본 70, 상한 90 |
 | 오도 리셋 | `O` | 캘리브레이션용 |
 | 도움말 | `?` | 전체 명령 목록 |
+
+**v37 에서 고친 것**
+
+| 버전 | 내용 |
+|---|---|
+| v36 | `ENCODER_DEBOUNCE_US` 를 2000 → **200** 으로 되돌림. v34 에서 올렸다가 카운트를 99% 잃었다. 부팅 배너에 실제 값을 찍는다 |
+| v37 | 방향 전환 교착 수정. 10Hz 명령이 300ms 대기를 매번 다시 시작시켜 `DIRECTION_CHANGE_PENDING` 만 뜨고 영원히 안 바뀌던 것 |
 
 **안티롤백**은 기본 꺼짐이다. 경사로에서 `AR1`(오르막·전진 버팀) /
 `AR2`(내리막·후진 버팀)로 켠다. **방향을 반대로 켜면 차가 스스로 밀려나간다.**
@@ -247,6 +264,7 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 | `tools/drive_wasd.py` | 키보드 수동 조종 |
 | `tools/check_ports.py` | 어느 포트가 뭔지 확인 |
 | `tools/odom_calib.py` | counts_per_meter 검증 (ROS) |
+| `tools/odom_compare.py` | 줄자↔엔코더↔우리 거리↔`/odom` 4중 비교 (누구 문제인지 갈라냄) |
 | `tools/measure.py` | counts_per_meter 실측 (시리얼 직결) |
 | `tools/team_monitor.py` | 각 팀 토픽 수신 상태 |
 | `tools/mode_sim.py` | 모드 전환 시뮬레이션 |
@@ -281,4 +299,6 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
   작년에는 같은 모터에서 동작했다 — 배선 문제일 가능성이 크다.
 - 센서 3개(라이다·카메라·GPS) 장착 위치 실측 → `t870_frames.yaml` 은 추정치.
 - 코스팅 거리, 지면 조향각, 잭업 회전수 미측정.
-- 안티롤백(v36) 경사로 실차 검증 미실시.
+- 안티롤백(v37) 경사로 실차 검증 미실시.
+- 5m 직선 `counts_per_meter` 재검증 미실시 (배터리 교체 후 조건이 달라졌다).
+- 구리 기판 소손 수리 전. 26V 인데 부하에서 12.9V 만 걸리던 원인.

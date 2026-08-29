@@ -229,14 +229,44 @@ def check_duplicates(ws):
         found += [p for p in glob.glob(pat) if os.path.isdir(p)]
     found = sorted(set(found))
 
-    for p in found:
-        print("    소스 %s" % p)
-    if len(found) > 1:
-        bad("t870_mcu 소스가 %d군데 있다. 어느 것이 도는지 아무도 모른다."
-            % len(found),
-            "쓰지 않는 쪽을 다른 이름으로 옮길 것 (지우지 말고)")
-    elif found:
-        ok("소스는 한 군데뿐")
+    #  ★ 전부 다 문제인 것은 아니다 (0830 수정).
+    #    Downloads 에 풀어둔 배포 사본은 colcon 이 보지도 않는다.
+    #    거기까지 치명으로 찍으면 진짜 문제가 묻힌다.
+    #
+    #    진짜 위험한 것만 고른다:
+    #      - 이 워크스페이스 안에 두 개 이상   → colcon 빌드가 깨진다
+    #      - 다른 "진짜 워크스페이스"(install/ 또는 build/ 가 있는 곳)
+    #        → source 하면 이쪽이 이길 수 있다
+    def _ws_root(path):
+        #  .../<root>/src/t870_mcu  →  <root>
+        return os.path.dirname(os.path.dirname(path))
+
+    in_this_ws = [p for p in found if os.path.abspath(_ws_root(p)) ==
+                  os.path.abspath(ws)]
+    other_built = [p for p in found
+                   if p not in in_this_ws
+                   and (os.path.isdir(os.path.join(_ws_root(p), "install"))
+                        or os.path.isdir(os.path.join(_ws_root(p), "build")))]
+    harmless = [p for p in found if p not in in_this_ws and p not in other_built]
+
+    for p in in_this_ws:
+        print("    이 워크스페이스  %s" % p)
+    for p in other_built:
+        print("    빌드된 다른 곳    %s" % p)
+    if harmless:
+        print("    (그 외 압축 풀어둔 사본 %d개 — colcon 이 안 본다. 문제 없음)"
+              % len(harmless))
+
+    if len(in_this_ws) > 1:
+        bad("이 워크스페이스 안에 t870_mcu 가 %d개 있다. "
+            "colcon 이 이름 중복으로 빌드를 통째로 실패시킨다." % len(in_this_ws),
+            "쓰지 않는 쪽 상위 폴더에 COLCON_IGNORE 를 만들 것")
+    elif other_built:
+        warn("빌드까지 되어 있는 t870_mcu 워크스페이스가 %d군데 더 있다. "
+             "그쪽을 source 하면 그 코드가 돈다." % len(other_built),
+             "새 터미널에서 원하는 워크스페이스 하나만 source 할 것")
+    elif in_this_ws:
+        ok("소스 중복 없음 (Downloads 의 사본 %d개는 무해)" % len(harmless))
 
     prefixes = [p for p in os.environ.get("AMENT_PREFIX_PATH", "").split(":") if p]
     hits = [p for p in prefixes
