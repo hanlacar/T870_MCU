@@ -22,7 +22,7 @@ ROS 2 Jazzy / Ubuntu 24.04 / Arduino Mega 2560 (115200 baud)
 새 파일을 넣고 빌드하고 정합성 감사까지 돌린다.
 
 ```bash
-cd ~/Downloads && unzip -o T870_MCU_0830_팀배포_v11.zip
+cd ~/Downloads && unzip -o T870_MCU_0830_팀배포_v12.zip
 cd T870_MCU_0830
 ./설치.sh              # 미리보기 — 아무것도 바꾸지 않는다
 ./설치.sh --apply      # 실제 설치

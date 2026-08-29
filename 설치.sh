@@ -53,6 +53,31 @@ if [ "$APPLY" -eq 0 ]; then
   say "########################################################"
 fi
 
+#  ★ 0830: 이 스크립트는 "zip 을 받은 팀원" 용이다.
+#     git clone 안에서 돌리면 클론이 곧 워크스페이스인데도
+#     ~/T870_MCU 라는 두 번째 워크스페이스를 새로 만들어 버린다.
+#     그러면 "어느 쪽이 도는지 모르는" 상태가 된다.
+if [ -d "$HERE/.git" ] && [ "$HERE" != "$WS" ]; then
+  say ""
+  say "########################################################"
+  say "#  ⚠ 여기는 git 저장소다 ($HERE)"
+  say "#"
+  say "#  이 스크립트는 zip 을 받은 팀원용이다."
+  say "#  git 으로 받았다면 클론 자체가 워크스페이스이므로"
+  say "#  설치할 필요 없이 빌드만 하면 된다:"
+  say "#"
+  say "#      cd $HERE && colcon build --symlink-install"
+  say "#"
+  say "#  그래도 다른 워크스페이스에 설치하려면 경로를 직접 줄 것:"
+  say "#      ./설치.sh --apply $HERE"
+  say "########################################################"
+  say ""
+  if [ "$APPLY" -eq 1 ]; then
+    say "  중단한다. 위 안내를 보고 다시 실행할 것."
+    exit 1
+  fi
+fi
+
 say ""
 say "워크스페이스 : $WS"
 say "새 파일 위치 : $HERE"
@@ -186,7 +211,12 @@ if [ "$APPLY" -eq 1 ]; then
   fi
 
   say "  colcon build 시작 (1분쯤 걸린다) — $ROS_SETUP"
-  ( cd "$WS" && . "$ROS_SETUP" && colcon build --symlink-install ) \
+  #  🔴 0830: ROS 의 setup.bash 는 정의되지 않은 변수를 참조한다
+  #     (AMENT_TRACE_SETUP_FILES, COLCON_TRACE 등).
+  #     set -u 가 켜진 채로 source 하면 그 줄에서 unbound variable 로 죽는다.
+  #     소싱하는 서브셸에서만 set +u 로 끈다.
+  #     → 실행.sh 에서 이미 겪은 것과 같은 버그다. 여기에도 있었다.
+  ( set +u; cd "$WS" && . "$ROS_SETUP" && colcon build --symlink-install ) \
     || { say ""; say "  ✗ 빌드 실패. 위 메시지를 SJ 한테 그대로 보낼 것."; exit 1; }
 else
   say "  [예정] cd $WS && colcon build --symlink-install"
