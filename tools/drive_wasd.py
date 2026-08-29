@@ -24,10 +24,27 @@ drive_wasd_v1_0826.py  —  T870 키보드 수동 조종 (WASD)
     D  조향 우 3도
     C  조향 중앙
 
+    0      ★ 조종권 토글 (대기 <-> 키보드 전용)
     Space  정지
     F      급정거 토글 (드라이브 0 과 달리 램프를 건너뛴다)
     E      E-Stop 토글
     R      E-Stop 래치 해제 (서비스 호출까지)
+
+조종권 (0 키)
+-------------
+    대기(STANDBY)   카메라/라이다/GPS 가 차를 몬다. 이 도구는 보고만 있는다.
+                    구동·조향을 발행하지 않는다.
+    조종(TAKEOVER)  키보드가 차를 몬다. 팀 명령은 전부 무시된다.
+                    manual 소스가 모드·우선순위와 무관하게 최우선이기 때문.
+
+    0 을 누르면 전환된다. 처음 진입할 때는 정지 + 조향 중앙에서 시작한다.
+    조종 중에 0 을 누르면 먼저 정지만 하고, 한 번 더 눌러야 팀에게 넘긴다
+    (달리는 상태로 넘기지 않기 위해).
+
+    ⚠ F(급정거)와 E(E-Stop)는 대기 중에도 항상 동작한다. 안전요원 역할.
+
+    ※ 이전 버전은 실행하는 순간부터 무조건 조종 상태였다. 팀 주행을 지켜보다
+      필요할 때만 잡는 것이 불가능했다.
 
     Z  구간 측정 시작
     X  구간 측정 끝 (결과 출력)
@@ -72,7 +89,8 @@ STEER_MAX = 27
 class Drive(Node):
 
     def __init__(self, hz, distance, source="manual", mcu_ns="/mcu",
-                 estop_topic="/estop_lock", reset_service=None):
+                 estop_topic="/estop_lock", reset_service=None,
+                 takeover=False):
         super().__init__("drive_wasd")
 
         # 내 명령
@@ -105,6 +123,9 @@ class Drive(Node):
         self.raw = ""
         self.raw_at = 0.0
         self.msg = ""
+
+        # 조종권. False 면 구동·조향을 발행하지 않아 팀이 차를 몬다.
+        self.takeover = bool(takeover)
 
         # 토픽 이름은 전부 인자로 받는다. 코드에 박아두면 팀원이 소스 이름을
         # 바꿀 때마다 파일을 고쳐야 한다.
@@ -158,12 +179,38 @@ class Drive(Node):
     # ---------- 발행 ----------
 
     def _publish(self):
-        d = Float32(); d.data = float(self.drive); self.pub_d.publish(d)
-        w = Int32();   w.data = int(self.wheel);   self.pub_w.publish(w)
+        # ---- 구동·조향은 조종권을 잡았을 때만 ----
+        #
+        # 발행을 멈추면 0.5초 뒤 manual 소스가 죽은 것으로 판정되어
+        # 매니저가 팀 우선순위(라이다 > 카메라 > GPS)로 돌아간다.
+        # 그래서 "안 보내는 것" 자체가 조종권을 놓는 방법이다.
+        if self.takeover:
+            d = Float32(); d.data = float(self.drive); self.pub_d.publish(d)
+            w = Int32();   w.data = int(self.wheel);   self.pub_w.publish(w)
+
+        # ---- 정지·E-Stop 은 대기 중에도 항상 보낸다 (안전요원) ----
         s = Bool();    s.data = bool(self.stop);   self.pub_s.publish(s)
         # estop 은 현재 상태를 항상 보낸다.
         # false 를 안 보내면 매니저 쪽이 계속 true 로 남는다.
         e = Bool();    e.data = bool(self.estop);  self.pub_e.publish(e)
+
+    def toggle_takeover(self):
+        """0 키. 대기 <-> 조종 전환."""
+        if not self.takeover:
+            # 진입: 정지 + 조향 중앙에서 시작한다. 팀이 주던 값을 이어받지 않는다.
+            self.drive = 0.0
+            self.wheel = 0
+            self.stop = False
+            self.takeover = True
+            self.msg = "조종권 획득 — 팀 명령 무시. 정지/중앙에서 시작"
+            return
+        if self.drive != 0.0:
+            # 달리는 상태로 팀에게 넘기지 않는다. 먼저 세운다.
+            self.drive = 0.0
+            self.msg = "정지했다. 0 을 한 번 더 누르면 팀에게 넘긴다"
+            return
+        self.takeover = False
+        self.msg = "조종권 반납 — 0.5초 뒤 팀 명령으로 돌아간다"
 
     def request_reset(self):
         self.estop = False
@@ -222,11 +269,20 @@ class Drive(Node):
         return out
 
     def all_stop(self):
+        """종료 시 정지 명령을 확실히 보낸다.
+
+        ⚠ 조종권을 잡은 채로 종료하면, 이 도구가 발행을 멈춘 0.5초 뒤
+          매니저가 팀 명령으로 돌아간다. 차를 확실히 세워두려면
+          E 로 E-Stop 을 걸고 나가야 한다 (그건 래치라 남는다).
+        """
+        was_takeover = self.takeover
         self.drive = 0.0
         self.stop = False
+        self.takeover = True          # 종료 순간에는 반드시 정지를 명령한다
         for _ in range(6):
             self._publish()
             time.sleep(0.05)
+        self.takeover = was_takeover
 
 
 # ============================================================
@@ -236,6 +292,11 @@ def render(n):
     w = L.append
     w("\033[2J\033[H")
     w("┌─ T870 수동 조종 (WASD) ──────────────────────────────────")
+    w("│")
+    if n.takeover:
+        w("│  \033[30;42m  조종 중 — 키보드 전용 (팀 명령 무시)  \033[0m   0=반납")
+    else:
+        w("│  \033[30;43m  대기 중 — 팀이 주행 (카메라/라이다/GPS)  \033[0m 0=조종")
     w("│")
 
     if n.stop:
@@ -286,7 +347,7 @@ def render(n):
     w("│  ── 키 ────────────────────────────────────────────")
     w("│   \033[1mW\033[0m 전진   \033[1mS\033[0m 후진   \033[1mA\033[0m 좌   \033[1mD\033[0m 우   \033[1mC\033[0m 중앙")
     w("│   Space 정지    F 급정거    E E-Stop    R 래치해제")
-    w("│   1 2 3 단계직접   0 정지")
+    w("│   1 2 3 단계직접   \033[1m0 조종권 토글\033[0m")
     w("│   Z 측정시작   X 측정끝   Q 종료")
     w("│")
     if n.msg:
@@ -323,8 +384,17 @@ def read_key(timeout):
     return {"A": "w", "B": "s", "C": "d", "D": "a"}.get(seq[-1])
 
 
+DRIVE_KEYS = ("w", "W", "s", "S", "a", "A", "d", "D", "c", "C", "1", "2", "3", " ")
+
+
 def handle(n, k):
     n.msg = ""
+
+    # 대기 중에는 주행 키가 아무 일도 하지 않는다. 조용히 무시하지 않고 알린다.
+    # (예전에는 무조건 발행돼서, 켜 두기만 해도 팀 명령이 막혔다)
+    if not n.takeover and k in DRIVE_KEYS:
+        n.msg = "대기 중이다. 0 을 눌러 조종권을 잡아라 (F/E 는 항상 동작)"
+        return
 
     if k in ("w", "W"):
         if n.drive < 0:
@@ -350,9 +420,13 @@ def handle(n, k):
     elif k in ("c", "C"):
         n.wheel = 0
 
+    elif k == "0":
+        n.toggle_takeover()
+        return
+
     elif k in ("1", "2", "3"):
         n.drive = float(k)
-    elif k == "0" or k == " ":
+    elif k == " ":
         n.drive = 0.0
         n.stop = False
 
@@ -389,11 +463,15 @@ def main():
     ap.add_argument("--estop-topic", default="/estop_lock")
     ap.add_argument("--reset-service", default=None,
                     help="기본값은 <mcu-ns>/reset_estop")
+    ap.add_argument("--takeover", action="store_true",
+                    help="처음부터 조종권을 잡은 상태로 시작한다. "
+                         "팀 노드 없이 혼자 시험할 때 편하다. "
+                         "기본은 대기 상태 — 0 을 눌러야 조종이 시작된다")
     args = ap.parse_args()
 
     rclpy.init()
     node = Drive(args.hz, args.distance, args.source, args.mcu_ns,
-                 args.estop_topic, args.reset_service)
+                 args.estop_topic, args.reset_service, args.takeover)
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
 
     fd = sys.stdin.fileno()
@@ -417,6 +495,10 @@ def main():
         node.destroy_node()
         rclpy.shutdown()
         print("\n정지 명령 전송 후 종료했습니다.")
+        if node.takeover:
+            print("⚠ 조종권을 잡은 채로 종료했습니다. 0.5초 뒤 팀 명령으로 "
+                  "돌아갑니다.\n  차를 확실히 세워두려면 E 로 E-Stop 을 걸고 "
+                  "나가야 합니다 (래치라 남습니다).")
         if node.runs:
             print("\n" + "=" * 52)
             print("  구간 측정 (%.1fm 기준)" % node.distance)
