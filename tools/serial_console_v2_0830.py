@@ -60,6 +60,40 @@ STOP_CMD = "1.00"
 SEND_HZ = 10.0
 MAX_SECONDS = 30.0        # 사람이 뛰어서 못 따라가는 길이는 막는다
 
+#  🔴 펌웨어는 telemetryEnabled = false 로 뜬다.
+#     즉 가만히 있으면 STATUS 를 한 줄도 안 준다. "S" 를 보내야 한 줄 준다.
+#     (Q 로 자동 발행을 켤 수도 있지만 토글이라 지금 상태를 모르면 위험하다.
+#      직접 물어보는 쪽이 확실하다 — measure.py 도 같은 방식이다.)
+POLL_HZ = 10.0
+
+_write_lock = threading.Lock()
+
+
+def send(ser, text):
+    """어느 스레드에서 보내든 줄이 섞이지 않게 한다."""
+    with _write_lock:
+        ser.write((text + "\n").encode("utf-8"))
+        ser.flush()
+
+
+class Poller(threading.Thread):
+    """STATUS 를 주기적으로 요청한다. 이게 없으면 카운트를 영영 못 본다."""
+
+    daemon = True
+
+    def __init__(self, ser):
+        threading.Thread.__init__(self)
+        self.ser = ser
+        self.alive = True
+
+    def run(self):
+        while self.alive:
+            try:
+                send(self.ser, "S")
+            except Exception:
+                return
+            time.sleep(1.0 / POLL_HZ)
+
 
 def find_port():
     """USB 장치 정보로 먼저 찾고, 없으면 ttyACM/ttyUSB 로 떨어진다."""
@@ -123,6 +157,20 @@ class Reader(threading.Thread):
             print(line)
 
 
+def _fresh_count(ser, reader, fallback):
+    """방금 찍은 카운트를 받아온다.
+
+    폴링 주기(0.1초) 만큼 값이 늦을 수 있는데, 구간의 끝에서는 그게
+    그대로 거리 오차가 된다. 그래서 경계에서는 한 번 더 물어보고 기다린다.
+    """
+    before = reader.status_count
+    send(ser, "S")
+    end = time.monotonic() + 0.5
+    while reader.status_count == before and time.monotonic() < end:
+        time.sleep(0.01)
+    return reader.count if reader.count is not None else fallback
+
+
 def timed_run(ser, reader, stage, seconds, cpm):
     """단계 <stage> 로 <seconds> 초 굴리고 스스로 세운다.
 
@@ -158,29 +206,31 @@ def timed_run(ser, reader, stage, seconds, cpm):
             elapsed = time.monotonic() - t0
             if elapsed >= seconds:
                 break
-            ser.write((cmd + "\n").encode("utf-8")); ser.flush()
+            send(ser, cmd)
             sys.stdout.write("\r  %4.1fs  카운트 %8d  RPM %6.2f  %-8s"
                              % (elapsed, (reader.count or 0) - base,
                                 reader.rpm, reader.state))
             sys.stdout.flush()
             time.sleep(1.0 / SEND_HZ)
-        run_counts = (reader.count or base) - base
         run_time = time.monotonic() - t0
-        stopped_at = reader.count
+        send(ser, STOP_CMD)             # 먼저 세운다
+        stopped_at = _fresh_count(ser, reader, base)
+        run_counts = stopped_at - base
     except KeyboardInterrupt:
-        run_counts = (reader.count or base) - base
         run_time = time.monotonic() - t0
-        stopped_at = reader.count
+        send(ser, STOP_CMD)
+        stopped_at = _fresh_count(ser, reader, base)
+        run_counts = stopped_at - base
         print("\n  [중단] 정지 명령을 보낸다")
 
     #  ---- 정지 + 코스팅 ----
-    ser.write((STOP_CMD + "\n").encode("utf-8")); ser.flush()
+    send(ser, STOP_CMD)
     print("\n  정지 명령 전송. 코스팅을 센다 (3초)...")
     coast_end = time.monotonic() + 3.0
     while time.monotonic() < coast_end:
-        ser.write((STOP_CMD + "\n").encode("utf-8")); ser.flush()
+        send(ser, STOP_CMD)
         time.sleep(1.0 / SEND_HZ)
-    coast_counts = (reader.count or stopped_at) - (stopped_at or 0)
+    coast_counts = _fresh_count(ser, reader, stopped_at) - stopped_at
 
     #  ---- 결과 ----
     speed_cps = run_counts / run_time if run_time else 0.0
@@ -237,7 +287,22 @@ def main():
 
     reader = Reader(ser, show_status=not args.quiet)
     reader.start()
-    time.sleep(0.3)
+
+    poller = Poller(ser)
+    poller.start()
+
+    #  STATUS 가 실제로 오는지 여기서 확인한다.
+    #  안 오면 자동 주행이 "카운트를 못 받았다" 로 막히는데,
+    #  그걸 명령을 친 다음에 알게 되면 늦다.
+    deadline = time.time() + 4.0
+    while reader.count is None and time.time() < deadline:
+        time.sleep(0.1)
+    if reader.count is None:
+        print("\n⚠ STATUS 응답이 없다. 자동 주행(!)이 안 된다.")
+        print("   아두이노 전원과 USB 를 확인할 것. 그래도 명령은 보낼 수 있다.\n")
+    else:
+        print("  ✓ STATUS 수신 — 현재 카운트 %d, 상태 %s\n"
+              % (reader.count, reader.state))
 
     try:
         while reader.alive:
@@ -275,20 +340,20 @@ def main():
             if not cmd:
                 continue
 
-            ser.write((cmd + "\n").encode("utf-8"))
-            ser.flush()
+            send(ser, cmd)
             print("[보냄] %s" % cmd)
     except KeyboardInterrupt:
         pass
     finally:
         #  ★ 나갈 때는 반드시 세운다. 콘솔을 닫았는데 차가 굴러가면 안 된다.
         try:
-            ser.write(b"1.00\n")
-            ser.flush()
+            send(ser, "1.00")
             time.sleep(0.2)
         except Exception:
             pass
+        poller.alive = False
         reader.alive = False
+        time.sleep(0.1)
         try:
             ser.close()
         except Exception:

@@ -22,7 +22,7 @@ ROS 2 Jazzy / Ubuntu 24.04 / Arduino Mega 2560 (115200 baud)
 새 파일을 넣고 빌드하고 정합성 감사까지 돌린다.
 
 ```bash
-cd ~/Downloads && unzip -o T870_MCU_0830_팀배포_v13.zip
+cd ~/Downloads && unzip -o T870_MCU_0831_팀배포_v15.zip
 cd T870_MCU_0830
 ./설치.sh              # 미리보기 — 아무것도 바꾸지 않는다
 ./설치.sh --apply      # 실제 설치
@@ -183,6 +183,34 @@ S_COURSE  T_PARK  ACCEL  PARALLEL_PARK  OUT
 
 ---
 
+## 🔴 0830 — 구동륜 슬립. wheel_odom 거리를 위치로 쓰지 말 것
+
+1단 15초, 같은 명령 3회의 실측:
+
+| 실제 이동 | 카운트 | 슬립 |
+|---|---|---|
+| 1.73 m | 2052 | 83% |
+| 4.98 m | 2543 | 61% |
+| 6.32 m | 2917 | 57% |
+
+같은 명령인데 간 거리가 3.6배 달랐다. **어떤 `counts_per_meter` 도 맞지 않는다.**
+
+검증한 것:
+
+- 엔코더 눈금은 정확 (1단 회귀 기울기 181.7 ≈ 스펙 199.5)
+- 전기 노이즈 아님 (바퀴 고정 후 구동 → 2초에 23카운트)
+- 원인은 구동륜 슬립 하나
+
+| 토픽 | 신뢰도 |
+|---|---|
+| `/mcu/encoder` | ✅ 바퀴 회전량 |
+| `/mcu/distance_m` | ⚠ 바퀴가 굴러간 거리 (지면 거리 아님) |
+| `wheel_odom` → `/odom` | 🔴 위치 추정에 쓰지 말 것 |
+
+**해결 방향**: 구동하지 않는 앞바퀴에 엔코더 장착. 펌웨어 자리(D18/D19) 준비됨.
+
+---
+
 ## 0830 동작 변경
 
 | 항목 | 전 | 후 | 왜 |
@@ -265,7 +293,11 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 | `tools/check_ports.py` | 어느 포트가 뭔지 확인 |
 | `tools/serial_console.py` | MCU 에 명령 직접 입력 (`A600` 조향끝값, `AR1` 안티롤백, `B` 급제동). ROS 불필요 |
 | `tools/odom_calib.py` | counts_per_meter 검증 (ROS) |
-| `tools/odom_compare.py` | 줄자↔엔코더↔우리 거리↔`/odom` 4중 비교 (누구 문제인지 갈라냄) |
+| `tools/odom_compare.py` | 줄자↔엔코더↔우리 거리↔`/odom` 4중 비교 |
+| `tools/run_v4_0830.py` | `[초] [단]` 지정 주행 후 자동 정지. 조향 명령 안 보냄 |
+| `tools/push_v1_0830.py` | 모터 끄고 손으로 밀어 counts_per_meter 측정 |
+| `tools/center_v2_0830.py` | 조향 1ms 미세조정 + 직진 시험 + 중앙 등록 |
+| `tools/serial_console_v2_0830.py` | MCU 명령 직접 입력 |
 | `tools/measure.py` | counts_per_meter 실측 (시리얼 직결) |
 | `tools/team_monitor.py` | 각 팀 토픽 수신 상태 |
 | `tools/mode_sim.py` | 모드 전환 시뮬레이션 |
@@ -273,6 +305,8 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 ---
 
 ## 문제 해결
+
+증상별 상세 대응은 **`문제해결.md`** 참고. 아래는 요약.
 
 | 증상 | 조치 |
 |---|---|
@@ -301,5 +335,9 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 - 센서 3개(라이다·카메라·GPS) 장착 위치 실측 → `t870_frames.yaml` 은 추정치.
 - 코스팅 거리, 지면 조향각, 잭업 회전수 미측정.
 - 안티롤백(v37) 경사로 실차 검증 미실시.
-- 5m 직선 `counts_per_meter` 재검증 미실시 (배터리 교체 후 조건이 달라졌다).
+- **구동륜 슬립 미해결.** 앞바퀴 엔코더 장착 전까지 wheel_odom 거리는 못 쓴다.
+- 조향 중앙은 매 전원 인가 시 `center_v2_0830.py` 로 다시 잡아야 한다
+  (펌웨어가 부팅 시 조향 누적을 0 으로 초기화).
+- 직진 중앙에서 A0 = 223 (0830 실측). 펌웨어 상수 363 은 낡았으나,
+  A0 가 조향을 따라가는지 미검증이라 아직 안 고쳤다.
 - 구리 기판 소손 수리 전. 26V 인데 부하에서 12.9V 만 걸리던 원인.
