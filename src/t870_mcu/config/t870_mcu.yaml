@@ -364,6 +364,34 @@ mcu_manager:
     #     (그때 5번 구간의 권한자가 카메라였다).
     #     이제 그 상황에서 매니저가 무엇을 고쳐야 하는지까지 로그로 찍는다.
     wheel_owner_default: "camera"
+    # ==========================================================
+    # 🔴 회피 게이트 (0831)
+    # ==========================================================
+    #   "5번 구간에서, /avoidance/active 가 true 일 때만
+    #    라이다가 조향과 속도를 조절할 수 있다."
+    #
+    #   그 규칙을 **중재기가 강제한다.** 게이트가 닫혀 있으면 라이다의
+    #   구동값·조향값을 아예 없는 것으로 취급한다.
+    #
+    #   ⚠ 급정거(/lidar_stop)는 게이트와 무관하게 항상 받는다.
+    #     안전은 게이트보다 위다.
+    #
+    #   신호는 **라이다 회피 노드가 발행**한다 (중재기는 구독만).
+    #   신호가 한 번도 안 오거나 timeout 을 넘기면 **막는다.**
+    #   못 받는 상태에서 라이다가 차를 모는 것보다 안 움직이는 편이 낫다.
+    #
+    #   safety_state 에 사유가 그대로 나온다:
+    #     AVOID_GATE(gate_false)      회피 노드가 false 를 보내는 중
+    #     AVOID_GATE(gate_no_signal)  신호를 한 번도 못 받았다
+    #     AVOID_GATE(gate_stale)      오다가 끊겼다
+    #
+    #   빈 목록으로 두면 게이트를 끈다 (아무것도 안 막는다).
+    avoidance_gate_topic: "/avoidance/active"
+    avoidance_gate_modes:
+      - "5"      # S 코스 — 곡선 + 장애물 우회
+    avoidance_gate_sources: ["lidar"]
+    avoidance_gate_timeout_s: 1.0
+
     wheel_owner_overrides:
       - "5:lidar"      # S 코스    곡선 + 장애물 우회
       - "7:lidar"      # T 주차

@@ -574,3 +574,218 @@ def test_별칭표_형식_파싱():
     #  별칭을 거친 값은 known_modes 안에 있어야 한다
     for v in table.values():
         assert v in NUM_MODES
+
+
+# ============================================================
+# S 코스 실행기 판정 로직 (0831)
+#   ROS 없이 시험할 수 있도록 순수 함수로 뺐다.
+# ============================================================
+
+import importlib.util as _ilu
+import os as _os
+
+_sc_path = _os.path.join(_os.path.dirname(__file__), "..", "..", "..",
+                         "tools", "s_course_v1_0831.py")
+_sc = None
+if _os.path.isfile(_sc_path):
+    _spec = _ilu.spec_from_file_location("s_course_tool", _sc_path)
+    _sc = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_sc)
+
+
+def _need_tool():
+    import pytest
+    if _sc is None:
+        pytest.skip("s_course_v1_0831.py 를 찾을 수 없다")
+
+
+def _syms(st):
+    _need_tool()
+    return [sym for sym, _, _ in _sc.diagnose(st)[1]]
+
+
+OKAY = {"mgr_alive": True, "mgr_mode": "5", "wheel_src": "lidar",
+        "drive_src": "lidar", "safety": "OK", "avoid_active": True,
+        "lidar_wheel_hz": 10.0, "lidar_drive_hz": 10.0}
+
+
+def test_s코스_전부_정상이면_통과():
+    _need_tool()
+    ok, _ = _sc.diagnose(dict(OKAY))
+    assert ok
+
+
+def test_s코스_매니저_없으면_거기서_멈춘다():
+    _need_tool()
+    ok, rows = _sc.diagnose({"mgr_alive": False})
+    assert not ok and len(rows) == 1
+
+
+def test_s코스_조향권한이_카메라면_잡아낸다():
+    #  0830 에 실제로 났던 상황. 이걸 못 잡으면 도구를 만든 의미가 없다.
+    st = dict(OKAY); st["wheel_src"] = "camera"
+    ok, rows = _sc.diagnose(st)
+    assert not ok
+    assert any("조향 권한이 'camera'" in t for _, t, _ in rows)
+
+
+def test_s코스_failsafe면_직진만_한다고_알려준다():
+    st = dict(OKAY); st["wheel_src"] = "failsafe"
+    ok, rows = _sc.diagnose(st)
+    assert not ok
+    assert any("직진만" in h for _, _, h in rows)
+
+
+def test_s코스_모드가_안_들어가면_잡아낸다():
+    st = dict(OKAY); st["mgr_mode"] = "0"
+    ok, rows = _sc.diagnose(st)
+    assert not ok
+    assert any("모드가 5가 아니다" in t for _, t, _ in rows)
+
+
+def test_s코스_라이다가_조용하면_잡아낸다():
+    st = dict(OKAY); st["lidar_wheel_hz"] = 0.0
+    ok, rows = _sc.diagnose(st)
+    assert not ok
+    assert any("라이다 조향이 안 온다" in t for _, t, _ in rows)
+
+
+def test_s코스_급정거는_치명으로_본다():
+    st = dict(OKAY); st["safety"] = "EMERGENCY_STOP(lidar)"
+    ok, rows = _sc.diagnose(st)
+    assert not ok
+    assert "🔴" in _syms(st)
+
+
+# ============================================================
+# 회피 활성 신호 (0831)
+#   라이다는 /avoidance/active 가 참일 때만 조향을 발행한다.
+#   권한(wheel_owner_overrides)과는 별개의 조건이라 둘 다 맞아야 한다.
+# ============================================================
+
+def _avoid_on(mode, modes):
+    """manager 가 하는 판정과 같은 규칙."""
+    return str(mode).strip().upper() in set(
+        str(m).strip().upper() for m in modes if str(m).strip())
+
+
+def test_게이트구간_5번에서만_적용된다():
+    modes = ["5"]
+    assert _avoid_on("5", modes)
+    for m in ("0", "1", "2", "3", "4", "6", "7", "8", "9", "10", "11"):
+        assert not _avoid_on(m, modes), m
+
+
+def test_게이트구간_목록이_비면_아무것도_안_막는다():
+    for m in ("5", "7", "10"):
+        assert not _avoid_on(m, [])
+
+
+def test_게이트구간_여러_개도_가능():
+    modes = ["5", "3"]
+    assert _avoid_on("5", modes) and _avoid_on("3", modes)
+    assert not _avoid_on("4", modes)
+
+
+def test_s코스_게이트_닫히면_잡아낸다():
+    _need_tool()
+    st = dict(OKAY); st["avoid_active"] = False
+    ok, rows = _sc.diagnose(st)
+    assert not ok
+    assert any("게이트 = false" in t for _, t, _ in rows)
+
+
+def test_s코스_게이트_신호가_없으면_치명으로_본다():
+    #  신호를 못 받으면 중재기가 라이다를 막으므로 차가 안 움직인다.
+    #  그걸 "라이다 노드가 죽었나" 로 오해하지 않게 따로 알린다.
+    _need_tool()
+    st = dict(OKAY); st["avoid_active"] = None
+    ok, rows = _sc.diagnose(st)
+    assert not ok
+    assert any("게이트 신호가 안 온다" in t for _, t, _ in rows)
+
+
+def test_s코스_회피신호_켜지면_통과():
+    _need_tool()
+    st = dict(OKAY); st["avoid_active"] = True
+    ok, _ = _sc.diagnose(st)
+    assert ok
+
+
+# ============================================================
+# 회피 게이트 — 중재기가 강제한다 (0831)
+#
+#   "5번 구간에서 /avoidance/active 가 true 일 때만
+#    라이다가 조향과 속도를 조절할 수 있다."
+#
+#   라이다의 자제에 기대지 않고 중재기가 막는다. 라이다 노드에 버그가
+#   있거나 옛 버전이 돌아도 차가 안 움직이게 하려면 여기서 막아야 한다.
+# ============================================================
+
+from t870_mcu.arbitration import InputManager, PrioritySelector
+
+GSRC = ["lidar", "camera", "gps", "manual"]
+
+
+def _rig():
+    inp = InputManager(GSRC)
+    sel = PrioritySelector(["lidar", "camera", "gps"], GSRC)
+    gate = WheelGate("camera", ["5:lidar", "7:lidar", "10:lidar"],
+                     GSRC, [str(i) for i in range(12)])
+    now = 100.0
+    inp.update_drive("lidar", 2.0, now, True, "ok")
+    inp.update_wheel("lidar", 15, now, True, "ok")
+    inp.update_stop("lidar", False, now)
+    return inp, sel, gate, now
+
+
+def test_게이트_열리면_라이다가_구동과_조향을_한다():
+    inp, sel, gate, now = _rig()
+    src, val, _ = sel.select(inp, now, 0.5)
+    assert src == "lidar" and val == 2.0
+    w, wsrc, wok, _ = gate.resolve("5", inp, now, 0.5, 0)
+    assert wok and wsrc == "lidar" and w == 15
+
+
+def test_게이트_닫히면_구동이_막힌다():
+    #  ★ 속도까지 막는 것이 이번 요구사항의 핵심이다.
+    #    구동은 원래 고정 우선순위라 모드와 무관하게 라이다가 1순위였다.
+    inp, sel, gate, now = _rig()
+    inp.set_blocked({"lidar": "gate_false"})
+    src, val, _ = sel.select(inp, now, 0.5)
+    assert src is None and val == 0.0
+
+
+def test_게이트_닫히면_조향도_막힌다():
+    inp, sel, gate, now = _rig()
+    inp.set_blocked({"lidar": "gate_false"})
+    w, wsrc, wok, reason = gate.resolve("5", inp, now, 0.5, 0)
+    assert not wok
+    assert w == 0                      # failsafe = 중앙
+    assert "gate_false" in reason
+
+
+def test_게이트_닫혀도_급정거는_통한다():
+    #  🔴 안전은 게이트보다 위다. 이게 깨지면 장애물을 못 피한다.
+    inp, sel, gate, now = _rig()
+    inp.set_blocked({"lidar": "gate_false"})
+    inp.update_stop("lidar", True, now)
+    assert inp.any_stop(["lidar", "camera", "gps"], now, 0.5) == ["lidar"]
+
+
+def test_게이트는_지정_소스만_막는다():
+    inp, sel, gate, now = _rig()
+    inp.update_drive("camera", 1.0, now, True, "ok")
+    inp.set_blocked({"lidar": "gate_false"})
+    src, val, _ = sel.select(inp, now, 0.5)
+    assert src == "camera" and val == 1.0
+
+
+def test_게이트_다시_열면_복구된다():
+    inp, sel, gate, now = _rig()
+    inp.set_blocked({"lidar": "gate_false"})
+    inp.set_blocked({})
+    src, _, _ = sel.select(inp, now, 0.5)
+    assert src == "lidar"
+    _, wsrc, wok, _ = gate.resolve("5", inp, now, 0.5, 0)
+    assert wok and wsrc == "lidar"
