@@ -501,3 +501,76 @@ def test_sanity_한계를_0으로_두면_검사를_끈다():
 def test_sanity_dt가_0이어도_안터진다():
     ok, _ = encoder_sanity(150, 100, 0.0, 2000.0)
     assert ok
+
+
+# ============================================================
+# 0831 — 번호 모드 + 조향 권한
+#
+#   0830 에 라이다로 S자 코스를 연습했는데 차가 직진만 했다.
+#   원인은 그 구간의 조향 권한자가 카메라였던 것. 아래는 그 규칙이
+#   번호 방식에서도 의도대로 도는지 고정해 두는 시험이다.
+# ============================================================
+
+from t870_mcu.arbitration import WheelGate
+
+NUM_MODES = [str(i) for i in range(0, 12)]      # 0 대기 + 1~11 구간
+NUM_OVERRIDES = ["5:lidar", "7:lidar", "10:lidar"]
+SOURCES = ["lidar", "camera", "gps", "manual"]
+
+
+def _gate():
+    return WheelGate("camera", NUM_OVERRIDES, SOURCES, NUM_MODES)
+
+
+def test_번호_S코스는_라이다가_조향한다():
+    #  5 = S_COURSE. 이게 camera 로 나오면 라이다 우회가 통째로 무시된다.
+    assert _gate().owner("5") == "lidar"
+
+
+def test_번호_주차_두_구간도_라이다():
+    g = _gate()
+    assert g.owner("7") == "lidar"       # T 주차
+    assert g.owner("10") == "lidar"      # 평행 주차
+
+
+def test_번호_나머지_구간은_카메라():
+    g = _gate()
+    for m in ("0", "1", "2", "3", "4", "6", "8", "9", "11"):
+        assert g.owner(m) == "camera", m
+
+
+def test_교차로_두_구간이_서로_다른_모드다():
+    #  번호 방식의 핵심. 이름 방식에서는 4번과 6번이 구분되지 않아
+    #  카메라가 어느 교차로인지 알 수 없었다.
+    g = _gate()
+    assert g.is_known("4") and g.is_known("6")
+    assert "4" != "6"
+
+
+def test_모르는_번호는_거부된다():
+    #  경로가 12구간이므로 13 은 없다. 오타가 조용히 넘어가면 안 된다.
+    g = _gate()
+    assert not g.is_known("12")
+    assert not g.is_known("S_COURSE")     # 별칭 치환 전에는 모르는 값
+
+
+def test_override_가_known_modes에_없으면_터진다():
+    #  yaml 오타를 띄우는 순간 잡는다. 조용히 기본 소유자로 넘어가면
+    #  주차 구간에서 조향이 엉뚱한 팀에게 간다.
+    import pytest
+    with pytest.raises(ValueError):
+        WheelGate("camera", ["99:lidar"], SOURCES, NUM_MODES)
+
+
+def test_별칭표_형식_파싱():
+    #  manager 가 하는 것과 같은 변환. 옛 이름이 번호로 바뀌는지.
+    raw = ["S_COURSE:5", "T_PARK:7", "PARALLEL_PARK:10", "NORMAL:1"]
+    table = {}
+    for e in raw:
+        old, new = e.split(":", 1)
+        table[old.strip().upper()] = new.strip().upper()
+    assert table["S_COURSE"] == "5"
+    assert table["NORMAL"] == "1"
+    #  별칭을 거친 값은 known_modes 안에 있어야 한다
+    for v in table.values():
+        assert v in NUM_MODES

@@ -22,7 +22,7 @@ ROS 2 Jazzy / Ubuntu 24.04 / Arduino Mega 2560 (115200 baud)
 새 파일을 넣고 빌드하고 정합성 감사까지 돌린다.
 
 ```bash
-cd ~/Downloads && unzip -o T870_MCU_0831_팀배포_v15.zip
+cd ~/Downloads && unzip -o T870_MCU_0831_팀배포_v18.zip
 cd T870_MCU_0830
 ./설치.sh              # 미리보기 — 아무것도 바꾸지 않는다
 ./설치.sh --apply      # 실제 설치
@@ -306,7 +306,7 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 
 ## 문제 해결
 
-증상별 상세 대응은 **`문제해결.md`** 참고. 아래는 요약.
+증상별 상세 대응은 **`문제해결.md`**, 구간 모드는 **`모드_사용법.md`** 참고. 아래는 요약.
 
 | 증상 | 조치 |
 |---|---|

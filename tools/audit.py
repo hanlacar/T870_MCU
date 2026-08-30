@@ -240,6 +240,73 @@ for m in re.finditer(r'executable="([^"]+)",\s*\n\s*name="([^"]+)"', ls):
     if "%s = t870_mcu" % exe not in setup:
         bad("launch 의 executable=\"%s\" 가 setup.py 에 없다." % exe, "[10] 런치")
 
+# ============================================================
+# [12] 도구(tools/) 가 yaml 과 어긋나 있나          ← 0831 추가
+#
+#   🔴 왜 넣었나
+#     0829 에 mode_topic 을 /vehicle_mode → /drive_mode 로 옮겼는데
+#     tools/mode_sim.py 의 기본값이 그대로 남았다. 감사는 소스와 yaml 만
+#     대조했지 tools/ 는 아예 보지 않아서 못 잡았고, 팀원이 그걸 밟았다.
+#     "모드를 눌러도 아무 일도 안 일어난다" 는 증상이 며칠 갔다.
+#     같은 부류(도구가 조용히 낡는 것)를 여기서 막는다.
+# ============================================================
+def _mgr_param(name):
+    for sec, body in (Y or {}).items():
+        if not isinstance(body, dict):
+            continue
+        pr = body.get("ros__parameters")
+        if isinstance(pr, dict) and name in pr:
+            return pr[name]
+    return None
+
+
+_sim = os.path.join(TOOLS, "mode_sim_v2_0831.py")
+if not os.path.isfile(_sim):
+    _cands = [f for f in sorted(os.listdir(TOOLS))
+              if f.startswith("mode_sim")] if os.path.isdir(TOOLS) else []
+    _sim = os.path.join(TOOLS, _cands[0]) if _cands else ""
+
+if _sim and os.path.isfile(_sim):
+    _txt = io.open(_sim, encoding="utf-8").read()
+    _simname = os.path.basename(_sim)
+
+    #  (1) 발행 토픽이 매니저가 구독하는 토픽과 같은가
+    _yaml_topic = _mgr_param("mode_topic")
+    _m = re.search(r'--mode-topic["\']\s*,\s*default\s*=\s*["\']([^"\']+)', _txt)
+    if _yaml_topic and _m and _m.group(1) != str(_yaml_topic):
+        bad("%s 의 기본 발행 토픽이 '%s' 인데 매니저는 '%s' 를 구독한다. "
+            "모드를 눌러도 매니저가 한 개도 못 받는다 (에러도 안 난다)."
+            % (_simname, _m.group(1), _yaml_topic), "[12] 도구↔yaml")
+
+    #  (2) 발행하는 모드 문자열이 known_modes 안에 있나
+    _known = _mgr_param("known_modes") or []
+    _known = set(str(v).strip().upper() for v in _known)
+    _alias = {}
+    for e in (_mgr_param("mode_aliases") or []):
+        t = str(e)
+        if ":" in t:
+            k, v = t.split(":", 1)
+            _alias[k.strip().upper()] = v.strip().upper()
+    if _known:
+        _sent = set(m.group(1).upper() for m in
+                    re.finditer(r'^\s*"[^"]*":\s*\("([^"]+)"', _txt, re.M))
+        _unknown = sorted(m for m in _sent
+                          if m not in _known and _alias.get(m) not in _known)
+        if _unknown:
+            bad("%s 가 known_modes 에 없는 모드를 발행한다: %s. "
+                "누르면 거부되고 policy 에 따라 조용히 무시된다."
+                % (_simname, ", ".join(_unknown)), "[12] 도구↔yaml")
+
+    #  (3) known_modes 인데 도구에서 못 누르는 것 (경고)
+    if _known:
+        _sent = set(m.group(1).upper() for m in
+                    re.finditer(r'^\s*"[^"]*":\s*\("([^"]+)"', _txt, re.M))
+        _missing = sorted(_known - _sent)
+        if _missing:
+            warn("%s 로 넣을 수 없는 모드가 있다: %s. 그 구간은 손으로 "
+                 "ros2 topic pub 해야 한다." % (_simname, ", ".join(_missing)),
+                 "[12] 도구↔yaml")
+
 # [11] 파이썬 문법
 import py_compile
 for base in (SRC, TOOLS):
