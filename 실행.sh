@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 # ==========================================================
-#  T870 MCU 실행 — 매번 이것만 치면 된다
+#  T870 MCU 실행
 #
-#    ./실행.sh          브릿지 + 매니저 실행 (평소 이거)
-#    ./실행.sh 조종     터미널로 직접 운전 (WASD)
-#    ./실행.sh 점검     이 PC 환경 점검 (안 될 때 먼저 이것)
-#    ./실행.sh 상태     지금 뭐가 도는지 한눈에
+#  ★ 창 하나에 하나씩 띄운다. 섞어 쓰지 말 것.
+#
+#    창1)  ./실행.sh 브릿지    아두이노 연결 (시리얼)
+#    창2)  ./실행.sh 중재      명령 중재기
+#    창3)  ./실행.sh 조종      WASD 수동 운전
+#    창4)  ./실행.sh 프레임    센서 위치 TF
+#
+#  한 창에 브릿지+중재를 같이 띄우려면:
+#    ./실행.sh 전체
+#
+#  그 밖에
+#    ./실행.sh 점검      안 될 때 제일 먼저
+#    ./실행.sh 상태      지금 뭐가 도는지
 #
 #  source 도 export 도 이 스크립트가 알아서 한다.
-#  터미널을 새로 열 때마다 뭘 칠 필요 없다.
 # ==========================================================
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export T870_WS="$HERE"
@@ -28,12 +36,15 @@ fi
 #    (0829: 이 순서를 반대로 두어 실행이 안 됐다. 라이다팀이 잡아줌)
 set -u
 
-MODE="${1:-실행}"
+MODE="${1:-도움말}"
 
 #  ★ 점검은 "안 될 때" 돌리는 것이라 빌드가 없어도 실행되어야 한다.
 #    나머지 명령만 빌드를 요구한다.
-if [ "$MODE" != "점검" ] && [ "$MODE" != "check" ] \
-   && [ ! -f "$HERE/install/setup.bash" ]; then
+case "$MODE" in
+  점검|check|상태|status|도움말|help|-h|--h*) NEED_BUILD=0 ;;
+  *) NEED_BUILD=1 ;;
+esac
+if [ "$NEED_BUILD" = "1" ] && [ ! -f "$HERE/install/setup.bash" ]; then
   echo "빌드가 안 되어 있다 (install/ 없음)."
   echo "  → cd $HERE && colcon build --symlink-install"
   echo "  또는  ./실행.sh 점검   으로 무엇이 문제인지 먼저 볼 것"
@@ -50,7 +61,6 @@ case "$MODE" in
   점검|check)
     exec python3 "$HERE/tools/preflight.py" --ws "$HERE"
     ;;
-
   상태|status)
     echo; echo "== 돌고 있는 노드 =="
     ros2 node list
@@ -60,29 +70,65 @@ case "$MODE" in
       printf "  %-18s %s\n" "$t" "${n:-없음}"
     done
     ;;
-
+  브릿지|bridge)
+    echo
+    echo " 브릿지만 띄운다 (아두이노 시리얼). 끄려면 Ctrl-C."
+    echo " 중재기는 다른 창에서:  ./실행.sh 중재"
+    echo
+    exec ros2 launch t870_mcu t870_mcu.launch.py manager:=false
+    ;;
+  중재|manager)
+    echo
+    echo " 중재기만 띄운다 (명령 우선순위·모드). 끄려면 Ctrl-C."
+    echo " 브릿지는 다른 창에서:  ./실행.sh 브릿지"
+    echo
+    exec ros2 launch t870_mcu t870_mcu.launch.py bridge:=false
+    ;;
+  프레임|frames|tf)
+    echo
+    echo " 센서 위치 static TF 를 띄운다. 끄려면 Ctrl-C."
+    echo " 확인:  ros2 run tf2_ros tf2_echo base_link front_laser"
+    echo
+    exec ros2 launch t870_mcu t870_frames.launch.py
+    ;;
   조종|drive)
     echo
-    echo " ⚠ 창이 뜨면 반드시 0 키를 눌러 조종권을 잡아야 한다."
-    echo "   그 전에는 팀 노드를 방해하지 않으려고 아무것도 발행하지 않는다."
-    echo "   (W A S D 주행 / F 급정거 / E 비상정지 / Q 종료)"
+    echo " ⚠ 브릿지가 다른 창에 떠 있어야 한다. 아니면 '아두이노 끊김' 이 뜬다."
+    echo " ⚠ 창이 뜨면 0 키를 눌러 조종권을 잡아야 움직인다."
+    echo "   (W A S D 주행 / F 급정거 / E E-Stop / Q 종료)"
     echo
     exec python3 "$HERE/tools/drive_wasd.py" --takeover
     ;;
-
-  실행|run)
+  전체|all|실행|run)
     echo
-    echo " 브릿지 + 매니저를 띄운다. 끄려면 Ctrl-C."
+    echo " 브릿지 + 중재기를 한 창에 띄운다. 끄려면 Ctrl-C."
+    echo " 조종은 반드시 다른 창에서:  ./실행.sh 조종"
     echo
     exec ros2 launch t870_mcu t870_mcu.launch.py
     ;;
-
+  도움말|help|-h|--help)
+    echo
+    echo "  창1)  ./실행.sh 브릿지    아두이노 연결 (시리얼)"
+    echo "  창2)  ./실행.sh 중재      명령 중재기"
+    echo "  창3)  ./실행.sh 조종      WASD 수동 운전"
+    echo "  창4)  ./실행.sh 프레임    센서 위치 TF"
+    echo
+    echo "  ./실행.sh 전체   브릿지+중재를 한 창에"
+    echo "  ./실행.sh 점검   안 될 때 제일 먼저"
+    echo "  ./실행.sh 상태   지금 뭐가 도는지"
+    echo
+    ;;
   *)
     echo "모르는 명령: $MODE"
-    echo "  ./실행.sh        브릿지+매니저"
-    echo "  ./실행.sh 조종   터미널 운전"
-    echo "  ./실행.sh 점검   환경 점검"
-    echo "  ./실행.sh 상태   현재 상태"
+    echo
+    echo "  창1)  ./실행.sh 브릿지    아두이노 연결"
+    echo "  창2)  ./실행.sh 중재      명령 중재기"
+    echo "  창3)  ./실행.sh 조종      WASD 수동 운전"
+    echo "  창4)  ./실행.sh 프레임    센서 위치 TF"
+    echo
+    echo "  ./실행.sh 전체   브릿지+중재를 한 창에"
+    echo "  ./실행.sh 점검   안 될 때 제일 먼저"
+    echo "  ./실행.sh 상태   지금 뭐가 도는지"
     exit 1
     ;;
 esac

@@ -163,8 +163,15 @@ def check_serial():
             break
         okk, out = run("fuser -v %s 2>&1" % dev)
         if out and "cannot" not in out.lower() and dev in out:
-            bad("%s 를 다른 프로세스가 잡고 있다:\n      %s" % (dev, out),
-                "그 프로그램을 끄거나  sudo fuser -k %s" % dev)
+            #  ★ 0901 — 우리 브릿지가 잡고 있는 건 정상이다.
+            #    ./실행.sh 를 띄워둔 채 점검을 돌리면 항상 걸린다.
+            #    예전에는 치명으로 찍어서 "fuser -k 하라" 고 안내했는데,
+            #    그대로 하면 자기 브릿지를 죽이는 꼴이었다.
+            if "bridge" in out:
+                ok("%s 는 우리 브릿지가 사용 중 (정상)" % dev)
+            else:
+                bad("%s 를 다른 프로그램이 잡고 있다:\n      %s" % (dev, out),
+                    "그 프로그램을 끄거나  sudo fuser -k %s" % dev)
 
 
 # ==========================================================
