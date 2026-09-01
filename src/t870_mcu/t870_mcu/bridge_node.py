@@ -1597,9 +1597,27 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.shutdown()
-        node.destroy_node()
-        rclpy.shutdown()
+        #  ★ 0901 — Ctrl-C 로 종료할 때 exit code 1 로 죽던 문제.
+        #
+        #    launch 로 띄우면 SIGINT 를 rclpy 가 먼저 받아 컨텍스트를 이미
+        #    shutdown 한다. 그 뒤 여기서 또 부르면
+        #      RCLError: rcl_shutdown already called on the given context
+        #    로 예외가 나고 프로세스가 1 로 끝난다. 그러면 launch 가
+        #      [ERROR] process has died ... exit code 1
+        #    을 찍어서, 정상 종료인데도 뭔가 크게 잘못된 것처럼 보인다.
+        #    실제로 팀원 PC 에서 이 빨간 줄 때문에 원인을 찾느라 시간을 썼다.
+        #
+        #    정리 자체는 실패해도 종료를 막지 않는다.
+        try:
+            node.shutdown()
+        except Exception:
+            pass
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
