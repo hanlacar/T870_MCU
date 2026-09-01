@@ -4,6 +4,12 @@
 
 **처음이면 [`시작하기.md`](시작하기.md) 부터 보세요.**
 
+```bash
+cd ~ && git clone https://github.com/hanlacar/T870_MCU mcu_ws
+cd ~/mcu_ws && colcon build --symlink-install && ./setup.sh
+```
+이미 쓰던 폴더가 있으면 `./설치.sh` → `./설치.sh --apply` (옛 파일을 백업으로 치우고 새로 빌드).
+
 ---
 
 ## 구조
