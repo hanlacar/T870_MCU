@@ -94,6 +94,14 @@ class InputManager:
     def update_stop(self, source, value, now) -> None:
         self.states[source].stop.update(1.0 if value else 0.0, now, True, "ok")
 
+    def invalidate_commands(self, reason="invalidated") -> None:
+        """Prevent commands from crossing a mode/ownership transition."""
+        for state in self.states.values():
+            state.drive.valid = False
+            state.drive.reason = reason
+            state.wheel.valid = False
+            state.wheel.reason = reason
+
     # ---- 조회 ----
 
     def set_blocked(self, blocked: Dict[str, str]) -> None:
@@ -230,25 +238,17 @@ class WheelGate:
             return True
         return str(mode).strip().upper() in self.known_modes
 
-    def owner(self, mode: str, gate_owner: Optional[str] = None) -> str:
-        """이 모드의 조향 권한자.
-
-        gate_owner 가 주어지면 그것이 최우선이다 (회피 게이트가 열린 순간).
-        게이트는 런타임 신호라 모드별 정적 표로는 표현할 수 없다.
-        """
-        if gate_owner:
-            return str(gate_owner).strip().lower()
+    def owner(self, mode: str) -> str:
         return self.overrides.get(str(mode).strip().upper(), self.default_owner)
 
     def resolve(self, mode: str, inputs: "InputManager", now: float,
-                timeout_s: float, failsafe_value: int,
-                gate_owner: Optional[str] = None) -> Tuple[int, str, bool, str]:
+                timeout_s: float, failsafe_value: int) -> Tuple[int, str, bool, str]:
         """(조향각, 사용된소스, 권한소스정상여부, 사유) 반환.
 
         권한 소스가 값을 안 주면 failsafe 값으로 폴백하되 '폴백 중'임을
         별도로 알린다. 구동은 이와 무관하게 계속된다.
         """
-        own = self.owner(mode, gate_owner)
+        own = self.owner(mode)
         if own in (CENTER_SOURCE, NO_SOURCE):
             return 0, CENTER_SOURCE, True, "no_wheel_source_by_design"
 

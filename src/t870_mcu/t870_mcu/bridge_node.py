@@ -61,6 +61,7 @@ v3 (2026-08-28) — 급정거 정상화 + 하드코딩 제거
 
 import math
 import os
+import fcntl
 import threading
 import time
 
@@ -72,7 +73,7 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TransformStamped
 
 try:
-    from tf2_ros import TransformBroadcaster
+    from tf2_ros import Buffer, TransformBroadcaster, TransformListener
     TF_OK = True
 except ImportError:
     TF_OK = False
@@ -80,13 +81,6 @@ except ImportError:
 import serial
 
 from .diagnostics import check_subscriptions
-from .odom_math import (
-    center_twist,
-    front_wheel_to_rear_axle,
-    integrate_rear_axle,
-    rear_to_center,
-    yaw_rate,
-)
 from .protocol import (
     encoder_sanity,
     parse_drive_stage,
@@ -95,6 +89,10 @@ from .protocol import (
     wheel_serial_command,
     parse_status,
 )
+from .odom_tf_contract import (copy_odom_pose_to_transform,
+                               odom_transform_matches,
+                               odom_ownership_fault,
+                               validate_frame_contract)
 
 # 연결 상태
 CONN_CLOSED = 0        # 포트 닫힘
@@ -263,7 +261,9 @@ class McuBridge(Node):
 
         # 오도메트리
         self.declare_parameter("counts_per_meter", 0.0)
-        self.declare_parameter("wheelbase_m", 0.73)
+        self.declare_parameter("vehicle_geometry_confirmed", False)
+        self.declare_parameter("wheelbase_m", 0.0)
+        self.declare_parameter("track_width_m", 0.0)
         self.declare_parameter("encoder_signed", False)
         #  엔코더 누적값이 1초에 이보다 많이 변하면 시리얼이 깨진 것으로 본다.
         #  199.8 counts/m 기준 2000 = 10 m/s. 이 차의 최고속(약 0.8m/s)의 12배라
@@ -314,26 +314,6 @@ class McuBridge(Node):
         # 조향 보정이 원인인지 바로 갈린다.
         # AS5600 으로 실제 조향각을 재게 되면 true 가 정답이다.
         self.declare_parameter("odom_steer_compensation", True)
-
-        # ---------- 0831 오돔 v2 ----------
-        #  front_track_m : 앞 윤거 [m]. 엔코더가 한쪽 바퀴에만 있어서
-        #                  선회 중 생기는 기하 오차를 보정하는 데 쓴다.
-        #                  🔴 0 이면 보정을 끄고 예전 cos(δ) 동작 그대로.
-        #                     실측해서 넣을 것 (27도 선회에서 최대 37% 차이).
-        #  encoder_side  : 엔코더가 달린 앞바퀴. "left" | "right"
-        #                  🔴 틀리면 보정이 오차를 두 배로 키운다. 확인 필수.
-        #  odom_reference: "rear_axle"(v37 동작) | "center"(0831 확정, 정중앙)
-        #  encoder_mount : 엔코더가 무엇의 회전을 세는가
-        #    "axle_center"  앞축 중앙 (구동모터 축 / 디퍼렌셜 입력).
-        #                   오픈 디퍼렌셜에서 이 회전은 좌우 바퀴의 **평균** 이다.
-        #                   = 앞축 중심 이동거리 → cos(δ) 만으로 정확히 환산된다.
-        #                   윤거 보정은 필요 없다. (기본값)
-        #    "single_wheel" 앞바퀴 한쪽의 허브. 선회 중 그 바퀴는 차 중심선과
-        #                   다른 거리를 돌므로 윤거 보정이 필요하다.
-        self.declare_parameter("encoder_mount", "axle_center")
-        self.declare_parameter("front_track_m", 0.0)
-        self.declare_parameter("encoder_side", "left")
-        self.declare_parameter("odom_reference", "rear_axle")
 
         gp = lambda name: self.get_parameter(name).value
         # port: "auto" 면 USB 장치 정보로 아두이노를 직접 찾는다.
@@ -386,7 +366,9 @@ class McuBridge(Node):
         self.estop_repeat_s = float(gp("estop_repeat_s"))
         self.stop_timeout = float(gp("stop_timeout_s"))
         self.cpm = float(gp("counts_per_meter"))
+        self.geometry_confirmed = bool(gp("vehicle_geometry_confirmed"))
         self.wheelbase = float(gp("wheelbase_m"))
+        self.track_width = float(gp("track_width_m"))
         self.encoder_signed = bool(gp("encoder_signed"))
         self.enc_max_cps = float(gp("encoder_max_counts_per_s"))
         self.odom_frame = str(gp("odom_frame"))
@@ -400,17 +382,6 @@ class McuBridge(Node):
         self.odom_vel_ratio = float(gp("odom_vel_error_ratio"))
         self.odom_vel_floor = float(gp("odom_vel_error_floor"))
         self.odom_steer_comp = bool(gp("odom_steer_compensation"))
-
-        self.encoder_mount = str(gp("encoder_mount")).strip().lower()
-        if self.encoder_mount not in ("axle_center", "single_wheel"):
-            raise ValueError("encoder_mount 는 axle_center 또는 single_wheel")
-        self.front_track = float(gp("front_track_m"))
-        self.encoder_side = str(gp("encoder_side")).strip().lower()
-        if self.encoder_side not in ("left", "right"):
-            raise ValueError("encoder_side 는 left 또는 right")
-        self.odom_reference = str(gp("odom_reference")).strip().lower()
-        if self.odom_reference not in ("rear_axle", "center"):
-            raise ValueError("odom_reference 는 rear_axle 또는 center")
         self._steer_range_warned = False
 
         if self.wheel_timeout_policy not in ("hold_last", "center"):
@@ -426,11 +397,22 @@ class McuBridge(Node):
                 % (BRAKE_PULSE_GUARD_S, BRAKE_PULSE_GUARD_S))
         if self.max_deg <= 0:
             raise ValueError("max_steer_deg must be > 0")
+        frames_ok, frames_reason = validate_frame_contract(
+            self.odom_frame, self.base_frame)
+        if not frames_ok:
+            raise ValueError("invalid odom TF frame contract: %s" % frames_reason)
+        if self.geometry_confirmed and (
+                self.wheelbase <= 0.0 or self.track_width <= 0.0):
+            raise ValueError(
+                "vehicle_geometry_confirmed=true requires measured "
+                "wheelbase_m and track_width_m")
         self.ms_per_deg = self.steer_limit_ms / self.max_deg
 
         # ---------- 연결 상태 ----------
         self.ser = None
         self.ser_lock = threading.Lock()
+        self._port_lock_fd = None
+        self.command_owner_ok = False
         self.conn_state = CONN_CLOSED
         self._last_connect_attempt = 0.0
         self._port_opened_at = 0.0
@@ -492,9 +474,9 @@ class McuBridge(Node):
         self._last_fw_state = ""      # 펌웨어 상태 전환 감지용
 
         # ---------- ROS I/O ----------
-        self.declare_parameter("input_drive_topic", "/mcu/cmd_drive")
-        self.declare_parameter("input_wheel_topic", "/mcu/cmd_wheel")
-        self.declare_parameter("input_stop_topic", "/mcu/cmd_stop")
+        self.declare_parameter("input_drive_topic", "/mcu_drive")
+        self.declare_parameter("input_wheel_topic", "/mcu_wheel")
+        self.declare_parameter("input_stop_topic", "/mcu_stop")
         self.in_drive_topic = str(self.get_parameter("input_drive_topic").value)
         self.in_wheel_topic = str(self.get_parameter("input_wheel_topic").value)
         _st = str(self.get_parameter("input_stop_topic").value)
@@ -516,9 +498,16 @@ class McuBridge(Node):
             (self._estop_topic_name, "std_msgs/msg/Bool", "비상정지"),
         ]
         self._diag_seen = set()
+        self.declare_parameter("expected_command_publisher", "mcu_manager")
+        self.declare_parameter("forbidden_direct_arduino_nodes", [
+            "camera_arduino_bridge", "arduino_bridge",
+            "serial_motor_bridge", "vehicle_interface_node"])
+        self.expected_command_publisher = str(
+            self.get_parameter("expected_command_publisher").value)
+        self.forbidden_direct_nodes = set(str(v).strip() for v in
+            self.get_parameter("forbidden_direct_arduino_nodes").value)
         self.diag_timer = self.create_timer(
-            3.0,
-            lambda: check_subscriptions(self, self._sub_specs, self._diag_seen))
+            3.0, self._diagnose_command_ownership)
 
         # ---------- 발행 토픽 (전부 파라미터) ----------
         # ★ 기본값을 전부 /mcu/ 네임스페이스로 옮겼다.
@@ -548,6 +537,7 @@ class McuBridge(Node):
             ("pub_topic_estop",       "/mcu/estop_latched"),
             ("pub_topic_hard_stop",   "/mcu/hard_stop_active"),
             ("pub_topic_odom",        "/odom"),
+            ("pub_topic_odom_diagnostic", "/mcu/odom"),
         ]
         for name, default in pubdefs:
             self.declare_parameter(name, default)
@@ -594,23 +584,16 @@ class McuBridge(Node):
             self.pub_wheel_legacy = None
             self.pub_tele_legacy = None
         self.pub_odom = self.create_publisher(Odometry, pt("pub_topic_odom"), 10)
-
-        #  ---- /odom 별칭 ----
-        #  우리는 원래 /mcu/odom 만 쏜다 (0829 에 팀원 노드와 이름이 겹쳐 물러섰다).
-        #  비워두면 발행하지 않는다. 켜기 전에 반드시 확인할 것:
-        #    미션팀 wheel_odom_node, 주차팀 mcu_odom_adapter.py 가 같은 /odom 을
-        #    쏘고 있다. 셋이 동시에 쏘면 구독자가 어느 걸 받을지 알 수 없다.
-        #    켤 때는 그 두 노드를 먼저 끄고, 팀에 공지한 뒤에 켠다.
-        self.declare_parameter("pub_topic_odom_alias", "")
-        _alias = str(self.get_parameter("pub_topic_odom_alias").value).strip()
-        if _alias and _alias != pt("pub_topic_odom"):
-            self.pub_odom_alias = self.create_publisher(Odometry, _alias, 10)
-            self.get_logger().warn(
-                "/odom 별칭 발행 켜짐: %s — 미션팀 wheel_odom_node 와 "
-                "주차팀 mcu_odom_adapter.py 가 꺼져 있는지 확인할 것" % _alias)
-        else:
-            self.pub_odom_alias = None
+        self.pub_odom_diag = self.create_publisher(
+            Odometry, pt("pub_topic_odom_diagnostic"), 10)
         self.tf_bc = TransformBroadcaster(self) if (TF_OK and self.publish_tf) else None
+        self.tf_buffer = Buffer() if (TF_OK and self.publish_tf) else None
+        self.tf_listener = (TransformListener(self.tf_buffer, self, spin_thread=False)
+                            if self.tf_buffer is not None else None)
+        self._odom_tf_claimed = not self.publish_tf
+        self._odom_tf_fault = None
+        self._tf_claim_started = time.monotonic()
+        self.tf_claim_timer = self.create_timer(0.5, self._claim_odom_tf)
 
         self.declare_parameter("reset_estop_service", "/mcu/reset_estop")
         self._reset_service_name = str(
@@ -644,6 +627,10 @@ class McuBridge(Node):
             self.get_logger().warn(
                 "counts_per_meter=0 → /odom, /vehicle/speed_mps, "
                 "/vehicle/distance_m 비활성. 실측 후 설정하세요.")
+        if not self.geometry_confirmed:
+            self.get_logger().error(
+                "FAIL_VEHICLE_GEOMETRY_UNCONFIRMED: measured wheelbase and "
+                "track_width are required; /odom and odom->base_link disabled")
 
     # ============================================================
     # 구독 콜백
@@ -838,6 +825,85 @@ class McuBridge(Node):
     # 연결 (논블로킹 상태머신)
     # ============================================================
 
+    def _diagnose_command_ownership(self):
+        check_subscriptions(self, self._sub_specs, self._diag_seen)
+        faults = []
+        for topic in (self.in_drive_topic, self.in_wheel_topic):
+            infos = self.get_publishers_info_by_topic(topic)
+            owners = [getattr(info, "node_name", "?") for info in infos]
+            if owners != [self.expected_command_publisher]:
+                faults.append("%s=%s" % (topic, sorted(owners)))
+        try:
+            live_nodes = {name for name, _namespace in
+                          self.get_node_names_and_namespaces()}
+        except Exception:
+            live_nodes = set()
+        forbidden = sorted(live_nodes & self.forbidden_direct_nodes)
+        if forbidden:
+            faults.append("direct Arduino bridge nodes=%s" % forbidden)
+        odom_owners = [getattr(info, "node_name", "?") for info in
+                       self.get_publishers_info_by_topic("/odom")
+                       if getattr(info, "node_name", "?") != self.get_name()]
+        if odom_owners:
+            self._odom_tf_fault = "duplicate /odom publishers=%s" % sorted(odom_owners)
+            faults.append(self._odom_tf_fault)
+        if "front_lidar_static_tf" in live_nodes:
+            faults.append(
+                "duplicate base_link->front_laser owner=front_lidar_static_tf")
+        self.command_owner_ok = not faults
+        if faults:
+            self.get_logger().error(
+                "Arduino command ownership invalid; serial output disabled: %s"
+                % "; ".join(faults))
+
+    def _claim_odom_tf(self):
+        """Claim odom->base_link only after proving no transform already exists."""
+        if self._odom_tf_claimed or self._odom_tf_fault:
+            self.tf_claim_timer.cancel()
+            return
+        if time.monotonic() - self._tf_claim_started < 1.5:
+            return
+        others = [getattr(info, "node_name", "?") for info in
+                  self.get_publishers_info_by_topic("/odom")
+                  if getattr(info, "node_name", "?") != self.get_name()]
+        existing_tf = False
+        try:
+            existing_tf = self.tf_buffer.can_transform(
+                self.odom_frame, self.base_frame, rclpy.time.Time())
+        except Exception:
+            existing_tf = False
+        self._odom_tf_fault = odom_ownership_fault(
+            others, existing_tf, self.base_frame)
+        if self._odom_tf_fault:
+            self.get_logger().fatal(self._odom_tf_fault)
+            self.close_serial()
+        else:
+            self._odom_tf_claimed = True
+            self.get_logger().info(
+                "exclusive odom ownership acquired: /odom and %s->%s" %
+                (self.odom_frame, self.base_frame))
+        self.tf_claim_timer.cancel()
+
+    def _acquire_port_lock(self):
+        """Hold an OS lock so only one bridge process owns this serial port."""
+        lock_path = "/tmp/t870_mcu_serial_%s.lock" % os.path.basename(self.port)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            return False
+        self._port_lock_fd = fd
+        return True
+
+    def _release_port_lock(self):
+        fd, self._port_lock_fd = self._port_lock_fd, None
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
     def _try_open(self):
         now = time.monotonic()
         if now - self._last_connect_attempt < self.reconnect_delay:
@@ -855,12 +921,19 @@ class McuBridge(Node):
             elif not found and not self.fallback_port:
                 self.port = ""      # 아직 안 꽂혔다. 다음 주기에 다시 찾는다.
 
-        if not self.port:
+        if not self.port or not self.command_owner_ok:
+            return
+
+        if not self._acquire_port_lock():
+            self.get_logger().error(
+                "Arduino serial port already owned by another MCU bridge: %s"
+                % self.port)
             return
 
         try:
             ser = serial.Serial(self.port, self.baud, timeout=0.1)
         except serial.SerialException as exc:
+            self._release_port_lock()
             msg = str(exc)
             if "busy" in msg.lower() or "denied" in msg.lower():
                 self.get_logger().error(
@@ -914,6 +987,7 @@ class McuBridge(Node):
                 ser.close()
             except Exception:
                 pass
+        self._release_port_lock()
 
     def send_line(self, line: str) -> bool:
         with self.ser_lock:
@@ -1002,6 +1076,13 @@ class McuBridge(Node):
         if self.conn_state != CONN_READY:
             return
         now = time.monotonic()
+
+        if not self.command_owner_ok:
+            self.send_line(drive_serial_command(0))
+            self.get_logger().error(
+                "MCU manager is not the sole command publisher; holding STOP",
+                throttle_duration_sec=3.0)
+            return
 
         drive_fresh = self.have_drive and (now - self.last_drive_rx <= self.drive_timeout)
         wheel_fresh = self.have_wheel and (now - self.last_wheel_rx <= self.wheel_timeout)
@@ -1227,8 +1308,11 @@ class McuBridge(Node):
     # ============================================================
 
     def update_odom(self, count: int, steer_ms: int):
-        valid = Bool(); valid.data = self.cpm > 0; self.pub_speed_valid.publish(valid)
-        if self.cpm <= 0:
+        odom_enabled = (self.cpm > 0 and self.geometry_confirmed and
+                        self.wheelbase > 0 and self._odom_tf_claimed and
+                        self._odom_tf_fault is None)
+        valid = Bool(); valid.data = odom_enabled; self.pub_speed_valid.publish(valid)
+        if not odom_enabled:
             return
 
         now = time.monotonic()
@@ -1276,32 +1360,22 @@ class McuBridge(Node):
                 "시간 기반 추정이 어긋난 상태다. C(중앙 복귀) 후 다시 볼 것."
                 % (steer_deg, self.max_deg, steer_ms))
 
-        # ---- 앞바퀴 이동거리 → 뒤축 중심 이동거리 ----
-        #
-        #  이 차는 4WD 이고 앞축·뒤축 모두 오픈 디퍼렌셜이다 (0831 확정).
-        #  엔코더는 앞바퀴 "한쪽" 에만 있으므로 선회 중에는 그 바퀴가
-        #  차 중심선과 다른 거리를 돈다. 윤거(front_track_m)를 넣으면
-        #  그 기하를 정확히 보정한다. 0 이면 예전 cos(δ) 동작 그대로다.
-        #
-        #  ⚠ 차동 슬립(토크가 헛도는 바퀴로 몰리는 것)은 여기서 못 고친다.
-        #    그건 라이다 스캔매칭 오돔이나 비구동 바퀴가 필요하다.
+        # 엔코더가 앞축(조향축)에 있으므로 뒤축 이동거리로 환산: d_rear = d_front·cos(δ)
+        # odom_steer_compensation=false 면 환산하지 않는다 (조향각을 못 믿을 때).
         d_front = delta / self.cpm
-        if self.odom_steer_comp:
-            #  앞축 중앙(모터/디퍼렌셜) 엔코더는 좌우 평균이라 이미 축 중심값이다.
-            #  → 윤거 보정 없이 cos(δ) 만 적용 (track=0 이 그 동작).
-            _track = (self.front_track
-                      if self.encoder_mount == "single_wheel" else 0.0)
-            d = front_wheel_to_rear_axle(
-                d_front, steer_rad, self.wheelbase,
-                _track, self.encoder_side)
-        else:
-            d = d_front
+        d = d_front * math.cos(steer_rad) if self.odom_steer_comp else d_front
         speed = d / dt
         self.distance_m += abs(d)
 
         dtheta = d * math.tan(steer_rad) / self.wheelbase
-        self.x, self.y, self.th = integrate_rear_axle(
-            self.x, self.y, self.th, d, steer_rad, self.wheelbase)
+        if abs(dtheta) > 1e-9:
+            radius = d / dtheta
+            self.x += radius * (math.sin(self.th + dtheta) - math.sin(self.th))
+            self.y -= radius * (math.cos(self.th + dtheta) - math.cos(self.th))
+        else:
+            self.x += d * math.cos(self.th)
+            self.y += d * math.sin(self.th)
+        self.th = math.atan2(math.sin(self.th + dtheta), math.cos(self.th + dtheta))
 
         m = Float32(); m.data = float(speed); self.pub_speed.publish(m)
         m = Float32(); m.data = float(speed * 3.6); self.pub_speed_kph.publish(m)
@@ -1340,32 +1414,16 @@ class McuBridge(Node):
                    * abs(speed * math.tan(steer_rad) / self.wheelbase)
                    + self.odom_vel_floor)
 
-        # ---- 발행 기준점 ----
-        #
-        #  self.x / self.y 는 항상 **뒤축 중심** 이다 (자전거 모델이 주는 점).
-        #  odom_reference="center" 면 0831 확정대로 네 바퀴 허브 중심
-        #  (차량 정중앙)으로 옮겨서 발행한다.
-        #
-        #  ★ 중심점은 회전 중 횡속도 vy 가 0 이 아니다. (L/2)*wz 만큼 쓸린다.
-        #    이걸 빠뜨리면 EKF 가 조용히 틀어진다.
-        if self.odom_reference == "center":
-            px, py = rear_to_center(self.x, self.y, self.th, self.wheelbase)
-            vx, vy, wz = center_twist(speed, steer_rad, self.wheelbase)
-        else:
-            px, py = self.x, self.y
-            vx, vy, wz = speed, 0.0, yaw_rate(speed, steer_rad, self.wheelbase)
-
         odom = Odometry()
         odom.header.stamp = self.get_clock().now().to_msg()
         odom.header.frame_id = self.odom_frame
         odom.child_frame_id = self.base_frame
-        odom.pose.pose.position.x = px
-        odom.pose.pose.position.y = py
+        odom.pose.pose.position.x = self.x
+        odom.pose.pose.position.y = self.y
         odom.pose.pose.orientation.z = math.sin(self.th * 0.5)
         odom.pose.pose.orientation.w = math.cos(self.th * 0.5)
-        odom.twist.twist.linear.x = vx
-        odom.twist.twist.linear.y = vy
-        odom.twist.twist.angular.z = wz
+        odom.twist.twist.linear.x = speed
+        odom.twist.twist.angular.z = speed * math.tan(steer_rad) / self.wheelbase
 
         # 6x6 행렬, 행 우선. 순서는 x y z roll pitch yaw.
         # 2D 차량이라 z/roll/pitch 는 쓰지 않으므로 큰 값을 넣어
@@ -1382,10 +1440,7 @@ class McuBridge(Node):
 
         twist_cov = [0.0] * 36
         twist_cov[0]  = sigma_v * sigma_v             # vx
-        #  vy: rear_axle 기준이면 항상 0 이라 모르는 값(big).
-        #      center 기준이면 (L/2)*wz 로 모델이 아는 값이므로 wz 와 같은 신뢰도.
-        twist_cov[7]  = (sigma_w * sigma_w * (0.5 * self.wheelbase) ** 2
-                         if self.odom_reference == "center" else big)
+        twist_cov[7]  = big                            # vy (횡슬립은 모델에 없음)
         twist_cov[14] = big
         twist_cov[21] = big
         twist_cov[28] = big
@@ -1393,8 +1448,8 @@ class McuBridge(Node):
         odom.twist.covariance = twist_cov
 
         self.pub_odom.publish(odom)
-        if self.pub_odom_alias is not None:
-            self.pub_odom_alias.publish(odom)
+        # Diagnostic mirror only. It is the exact same message object/stamp.
+        self.pub_odom_diag.publish(odom)
 
         if self.tf_bc:
             # ★ 0829 수정: send_transform (X) → sendTransform (O)
@@ -1405,13 +1460,12 @@ class McuBridge(Node):
             #        → 아두이노가 FAULT 를 내도 E-Stop 래치가 안 걸렸다
             #   TF 실패가 다른 처리를 막지 않도록 여기서 따로 잡는다.
             try:
-                tf = TransformStamped()
-                tf.header = odom.header
-                tf.child_frame_id = self.base_frame
-                tf.transform.translation.x = px
-                tf.transform.translation.y = py
-                tf.transform.rotation.z = odom.pose.pose.orientation.z
-                tf.transform.rotation.w = odom.pose.pose.orientation.w
+                tf = copy_odom_pose_to_transform(odom, TransformStamped())
+                matches, reason = odom_transform_matches(odom, tf)
+                if not matches:
+                    self._odom_tf_fault = "FAIL_ODOM_TF_MISMATCH:%s" % reason
+                    self.get_logger().fatal(self._odom_tf_fault)
+                    return
                 self.tf_bc.sendTransform(tf)
             except Exception as exc:
                 if not self._tf_warned:
@@ -1440,7 +1494,8 @@ def main(args=None):
     finally:
         node.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

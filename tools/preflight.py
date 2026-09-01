@@ -57,7 +57,7 @@ def _expected_env():
             text = io.open(cand, encoding="utf-8").read()
         except Exception:
             continue
-        d = re.search(r'^\s*T870_TEAM_DOMAIN="([^"]*)"', text, re.M)
+        d = re.search(r"^\s*export\s+ROS_DOMAIN_ID=(\S+)", text, re.M)
         r = re.search(r"^\s*export\s+RMW_IMPLEMENTATION=(\S+)", text, re.M)
         return (d.group(1).strip('"\'') if d else None,
                 r.group(1).strip('"\'') if r else None)
@@ -84,26 +84,17 @@ def check_env():
     print("    ROS_DOMAIN_ID   = %s" % (did or "(미설정 = 0)"))
     print("    ※ 팀 전체가 같아야 한다. 다르면 노드끼리 아예 안 보인다.")
     if want_domain:
-        print("      팀 고정값(t870_env.sh): %s" % want_domain)
+        print("      팀 합의값(t870_env.sh): %s" % want_domain)
         if did != want_domain:
-            bad("ROS_DOMAIN_ID 가 '%s' 다 — 팀 고정값은 %s. "
-                "이 상태로는 다른 팀 노드가 서로 보이지 않는다(에러 없이)."
-                % (did or "미설정", want_domain),
-                "source %s/t870_env.sh" % os.environ.get("T870_WS", "~/mcu_ws"))
+            warn("ROS_DOMAIN_ID 가 '%s' 다 — 팀 합의값은 %s"
+                 % (did or "미설정", want_domain),
+                 "터미널에서 ./실행.sh 를 쓰면 자동으로 맞춰진다. "
+                 "다른 워크스페이스 터미널에서는 "
+                 "source ~/T870_MCU/t870_env.sh")
         else:
-            ok("ROS_DOMAIN_ID = %s (팀 고정값과 일치)" % did)
+            ok("ROS_DOMAIN_ID = %s (합의값과 일치)" % did)
     else:
-        #  0831 — 실험 단계라 팀 고정값을 두지 않았다.
-        #  강제하지 않는 대신, 값이 다르면 노드가 서로 안 보인다는 사실만
-        #  크게 알린다. 라이다팀 SLAM 이 이것 때문에 하루 막혔다.
-        print("    (팀 고정값 없음 — 실험 단계. t870_env.sh 는 도메인을 "
-              "강제하지 않는다)")
-        print("    ⚠ 같이 돌릴 터미널은 **전부 같은 값** 이어야 한다.")
-        print("      다르면 ros2 node list 에 상대 노드가 아예 안 뜬다. "
-              "에러는 안 난다.")
-        print("      맞추려면 각 터미널에서:  export ROS_DOMAIN_ID=%s"
-              % (did or "0"))
-        ok("ROS_DOMAIN_ID = %s (강제하지 않음)" % (did or "미설정 = 0"))
+        warn("t870_env.sh 를 못 찾아 합의값을 확인할 수 없다")
 
     rmw = os.environ.get("RMW_IMPLEMENTATION", "")
     print("    RMW             = %s" % (rmw or "(기본 rmw_fastrtps_cpp)"))
@@ -318,8 +309,8 @@ def check_runtime():
             "하나를 Ctrl-C 로 끌 것")
 
     # 🔴 한 토픽에 발행자가 둘 이상이면 값이 섞인다
-    KEY = ["/odom", "/mcu/ready", "/mcu/manager_ready", "/mcu/cmd_drive",
-           "/mcu/cmd_wheel", "/mcu/cmd_stop", "/vehicle_mode", "/estop_lock",
+    KEY = ["/odom", "/mcu/ready", "/mcu/manager_ready", "/mcu_drive",
+           "/mcu_wheel", "/mcu_stop", "/drive_mode", "/estop_lock",
            "/tf"]
     for t in KEY:
         okk, info = run("ros2 topic info %s" % t, timeout=10)

@@ -76,13 +76,12 @@ class TeamMonitor(Node):
             sub("%s_drive" % src, topics["%s_drive" % src], Float32, f)
             sub("%s_wheel" % src, topics["%s_wheel" % src], Int32, i)
         sub("lidar_stop", topics["lidar_stop"], Bool, b)
-        sub("camera_stop", topics["camera_stop"], Bool, b)
         sub("mode", topics["mode"], String, s)
 
         # 중재 출력
-        sub("mcu_drive", ns + "/cmd_drive", Float32, f)
-        sub("mcu_wheel", ns + "/cmd_wheel", Int32, i)
-        sub("mcu_stop", ns + "/cmd_stop", Bool, b)
+        sub("mcu_drive", "/mcu_drive", Float32, f)
+        sub("mcu_wheel", "/mcu_wheel", Int32, i)
+        sub("mcu_stop", "/mcu_stop", Bool, b)
         sub("act_drive", ns + "/active_drive_source", String, s)
         sub("act_wheel", ns + "/active_wheel_source", String, s)
         sub("safety", ns + "/safety_state", String, s)
@@ -143,7 +142,7 @@ class TeamMonitor(Node):
 
         w("│  ── 중재 출력 ──────────────────────────────────────────")
         stopv = C["mcu_stop"].value
-        w("│   /mcu/cmd_drive \033[1m%-6s\033[0m /mcu/cmd_wheel \033[1m%-5s\033[0m /mcu/cmd_stop %s"
+        w("│   /mcu_drive \033[1m%-6s\033[0m /mcu_wheel \033[1m%-5s\033[0m /mcu_stop %s"
           % (val("mcu_drive", "%+.0f"), val("mcu_wheel", "%+d"),
              "\033[31mTRUE\033[0m" if stopv else "false"))
         w("│   구동소스 \033[36m%-10s\033[0m 조향소스 \033[36m%s\033[0m"
@@ -177,8 +176,7 @@ def main():
         ap.add_argument("--%s-drive" % src, default="/%s_drive" % src)
         ap.add_argument("--%s-wheel" % src, default="/%s_wheel" % src)
     ap.add_argument("--lidar-stop", default="/lidar_stop")
-    ap.add_argument("--camera-stop", default="/camera_stop")
-    ap.add_argument("--mode", default="/vehicle_mode")
+    ap.add_argument("--mode", default="/drive_mode")
     ap.add_argument("--mcu-ns", default="/mcu",
                     help="MCU 발행 토픽 접두어")
     a = ap.parse_args()
@@ -187,7 +185,7 @@ def main():
         "camera_drive": a.camera_drive, "camera_wheel": a.camera_wheel,
         "lidar_drive": a.lidar_drive, "lidar_wheel": a.lidar_wheel,
         "gps_drive": a.gps_drive, "gps_wheel": a.gps_wheel,
-        "lidar_stop": a.lidar_stop, "camera_stop": a.camera_stop,
+        "lidar_stop": a.lidar_stop,
         "mode": a.mode,
     }
 

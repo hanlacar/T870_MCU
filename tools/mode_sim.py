@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-mode_sim_v2_0831.py  —  모드 시뮬레이터 + 중재 테스트 하네스
+mode_sim.py  —  모드 시뮬레이터 + 중재 테스트 하네스
 
-키보드로 구간 모드를 바꿔가며 중재기(manager_node)가 제대로 동작하는지 본다.
-
-🔴 0831 에 고친 것 — 이전 버전은 아예 동작하지 않았다
-  ① 발행 토픽 기본값이 "/vehicle_mode" 였다.
-     0829 에 매니저를 "/drive_mode" 로 옮겼는데 이 파일이 뒤에 남았다.
-     매니저가 한 글자도 못 받아서, 눌러도 모드가 안 바뀌었다.
-  ② 모드 목록이 낡아 있었다. ACCELERATION(→ACCEL), MANUAL(없는 모드)이
-     남아 있고 S_COURSE / D_COURSE / OUT 은 아예 키가 없었다.
-     그래서 S자 코스를 키보드로 넣을 방법이 없었다.
-  ③ 조향 권한 표시를 코드에 박아뒀다("주차면 lidar"). yaml 을 고쳐도
-     화면은 옛 규칙을 보여줬다. 이제 매니저가 실제로 쓰는 값
-     (/mcu/active_wheel_source)을 그대로 보여준다.
-  ④ 보낸 모드와 매니저가 받아들인 모드를 나란히 띄운다.
-     둘이 다르면 화면에 크게 뜬다 — 토픽·이름 불일치를 즉시 알 수 있다.
+GPS팀이 /vehicle_mode 를 아직 안 만들었으므로, 키보드로 모드를 바꿔가며
+중재기(manager_node)가 제대로 동작하는지 확인한다.
 
 각 팀 노드가 없어도 카메라/라이다/GPS 명령을 흉내낼 수 있어서,
 '주차 모드에서만 라이다가 조향을 가져가는가' 같은 규칙을 혼자 검증할 수 있다.
@@ -46,28 +34,16 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, Float32, Int32, String
 
 
-#  키 → (발행할 모드 문자열, 설명)
-#
-#  0831 부터 모드는 **경로 순번**이다. 이름이 아니다.
-#  카메라가 구간마다 다른 로직을 쓰는데, 이름 방식에서는 NORMAL 이
-#  경로에 5번 나와서 몇 번째인지 구분할 수 없었다. 번호는 그 자체가
-#  구간 식별자라 그 문제가 없다.
-#
-#  ⚠ 이 표는 yaml 의 known_modes 와 일치해야 한다.
-#     tools/audit.py 가 자동으로 대조한다 (0831 추가).
+# 숫자키 → 모드. GPS팀이 나중에 이 문자열을 그대로 발행하면 된다.
 MODES = {
-    "0": ("0",  "대기 (출발 전)"),
-    "1": ("1",  "출발 직선"),
-    "2": ("2",  "경사로"),
-    "3": ("3",  "D 코스  직각·굴절"),
-    "4": ("4",  "교차로"),
-    "5": ("5",  "S 코스  곡선 + 장애물     ★ 라이다 조향"),
-    "6": ("6",  "교차로"),
-    "7": ("7",  "T 주차                   ★ 라이다 조향"),
-    "8": ("8",  "좌회전"),
-    "9": ("9",  "가속 구간"),
-    "a": ("10", "평행 주차                ★ 라이다 조향"),
-    "b": ("11", "마지막 주행 (종점까지)"),
+    "0": ("IDLE",          "정지 대기"),
+    "1": ("NORMAL",        "일반 주행 (차선추종)"),
+    "2": ("SLOPE",         "경사로"),
+    "3": ("INTERSECTION",  "교차로"),
+    "4": ("T_PARK",        "직각주차"),
+    "5": ("PARALLEL_PARK", "평행주차"),
+    "6": ("ACCELERATION",  "가속구간"),
+    "7": ("MANUAL",        "수동"),
 }
 
 SIM_SOURCES = ["camera", "lidar", "gps"]
@@ -75,7 +51,7 @@ SIM_SOURCES = ["camera", "lidar", "gps"]
 
 class ModeSim(Node):
 
-    def __init__(self, mcu_ns="/mcu", mode_topic="/drive_mode",
+    def __init__(self, mcu_ns="/mcu", mode_topic="/vehicle_mode",
                  estop_topic="/estop_lock"):
         # 토픽 이름은 전부 인자로 받는다. 코드에 박아두면 팀마다 이름이
         # 다를 때 파일을 고쳐야 한다.
@@ -98,7 +74,6 @@ class ModeSim(Node):
         self.act_drive_src = "?"
         self.act_wheel_src = "?"
         self.safety = "?"
-        self.mgr_mode = "?"          # 매니저가 실제로 받아들인 모드
         self.last_rx = 0.0
 
         # ---- 발행 ----
@@ -120,8 +95,6 @@ class ModeSim(Node):
         self.create_subscription(
             String, ns + "/active_wheel_source", self._cb_aws, 10)
         self.create_subscription(String, ns + "/safety_state", self._cb_safety, 10)
-        #  ★ 보낸 모드가 실제로 먹혔는지 보려면 이게 있어야 한다
-        self.create_subscription(String, ns + "/current_mode", self._cb_cmode, 10)
 
         self.create_timer(0.1, self._publish_loop)   # 10Hz — 타임아웃 0.5s 충족
 
@@ -144,9 +117,6 @@ class ModeSim(Node):
 
     def _cb_safety(self, m):
         self.safety = str(m.data)
-
-    def _cb_cmode(self, m):
-        self.mgr_mode = str(m.data)
 
     # ---------- 주기 발행 ----------
 
@@ -176,27 +146,13 @@ def render(node):
     w("┌─ 모드 시뮬레이터 ─ 중재 테스트 ──────────────────────────")
     w("│")
 
-    # 모드 — 보낸 값과 매니저가 받아들인 값을 나란히
+    # 모드
     desc = next((d for k, (mm, d) in MODES.items() if mm == node.mode), "")
-    w("│  보낸 모드   \033[1;36m%-6s\033[0m %s" % (node.mode, desc))
+    w("│  현재 모드   \033[1;36m%-15s\033[0m %s" % (node.mode, desc))
 
-    if node.mgr_mode == "?":
-        w("│  매니저 모드 \033[90m아직 수신 없음\033[0m  "
-          "(매니저가 떠 있나? 토픽 이름이 맞나?)")
-    elif node.mgr_mode != node.mode:
-        w("│  매니저 모드 \033[1;31m%-6s ← 다르다!\033[0m" % node.mgr_mode)
-        w("│    보낸 값이 안 먹었다. 원인: 토픽 이름 불일치, 또는")
-        w("│    known_modes 에 없는 값이라 거부됨(policy=keep 이면 직전 유지).")
-        w("│    매니저 로그를 볼 것.")
-    else:
-        w("│  매니저 모드 \033[32m%-6s ✓\033[0m" % node.mgr_mode)
-
-    # 조향 권한 — 매니저가 실제로 쓰는 값. 추측하지 않는다.
-    owner = node.act_wheel_src
-    note = ""
-    if owner == "failsafe":
-        note = "  \033[31m← 권한자가 값을 안 준다. 조향 중앙 고정\033[0m"
-    w("│  조향 권한   \033[33m%s\033[0m%s" % (owner, note))
+    # 조향 권한 (설정과 동일한 규칙)
+    owner = "lidar" if node.mode in ("T_PARK", "PARALLEL_PARK") else "camera"
+    w("│  조향 권한   \033[33m%s\033[0m  (주차 모드에서만 lidar)" % owner)
     w("│")
 
     # 시뮬 소스
@@ -240,7 +196,7 @@ def render(node):
 
     # 키 안내
     w("│  ── 조작 ────────────────────────────────────────")
-    w("│   0~9,a,b  모드 전환 (a=10  b=11)")
+    w("│   0~7   모드 전환")
     w("│   c/l/g 카메라/라이다/GPS 발행 ON·OFF")
     w("│   C/L/G 그 소스의 drive 단계 순환 (0→1→2→3→-1)")
     w("│   ←  →  선택된 소스의 조향각 ±5도    t  조향 대상 전환")
@@ -310,10 +266,7 @@ def main():
         description="모드 전환 시뮬레이션 — 차 없이 중재 로직만 확인")
     ap.add_argument("--mcu-ns", default="/mcu",
                     help="MCU 발행 토픽 접두어")
-    #  🔴 매니저의 mode_topic 과 반드시 같아야 한다.
-    #     0829 에 /vehicle_mode → /drive_mode 로 옮겼다.
-    #     (GPS팀이 /vehicle_mode 를 Int32 로 쓰고 있어 이름이 겹쳤다)
-    ap.add_argument("--mode-topic", default="/drive_mode")
+    ap.add_argument("--mode-topic", default="/vehicle_mode")
     ap.add_argument("--estop-topic", default="/estop_lock")
     args = ap.parse_args()
 
