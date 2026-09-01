@@ -10,11 +10,31 @@
 #    값을 바꿔야 하면 MCU 담당(SJ)에게 말하고 전원이 같이 받는다.
 # ==========================================================
 
-# ---- 팀 합의값 ----
-#  2026-08-29 기준 실제로 팀이 쓰고 있는 값을 그대로 넣었다.
-#  (팀원 PC 확인: ROS_DOMAIN_ID=77, RMW=rmw_fastrtps_cpp)
-export ROS_DOMAIN_ID=77
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# ---- DOMAIN / RMW ----
+#
+#  ★ 0831 변경 — 도메인을 **강제하지 않는다.**
+#
+#    지금은 팀마다 다른 값으로 실험하는 단계다. 여기서 특정 값을 export 하면
+#    그 터미널만 몰래 다른 도메인으로 떠서, 다른 팀 노드가 통째로 안 보인다.
+#    (에러도 경고도 안 난다. 0831 라이다팀 SLAM 이 이것 때문에 하루 막혔다.)
+#
+#    그래서 규칙을 뒤집었다:
+#      · 셸에 이미 ROS_DOMAIN_ID 가 있으면 → 그대로 존중한다
+#      · 없으면 → 손대지 않는다 (ROS 기본값 0)
+#    즉 이 파일을 source 해도 도메인이 바뀌지 않는다.
+#
+#    특정 값으로 맞춰서 돌리고 싶으면 그 터미널에서 직접:
+#        export ROS_DOMAIN_ID=77
+#    팀 전체를 하나로 고정할 때가 되면 아래 T870_TEAM_DOMAIN 에 값을 넣는다.
+T870_TEAM_DOMAIN=""          # 비워두면 강제하지 않음. 예: "77"
+
+if [ -n "$T870_TEAM_DOMAIN" ]; then
+  export ROS_DOMAIN_ID="$T870_TEAM_DOMAIN"
+fi
+export T870_TEAM_DOMAIN
+
+#  RMW 도 마찬가지로 강제하지 않는다. 이미 설정돼 있으면 그것을 쓴다.
+#  (팀 PC 는 대부분 rmw_fastrtps_cpp 가 기본이다)
 
 # 다른 PC 의 노드가 보여야 하므로 켜 두면 안 된다
 unset ROS_LOCALHOST_ONLY

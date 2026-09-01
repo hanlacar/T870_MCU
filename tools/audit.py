@@ -317,6 +317,23 @@ for base in (SRC, TOOLS):
         except Exception as e:
             bad("%s 문법 오류: %s" % (fn, e), "[11] 문법")
 
+# [13] 문서가 없는 도구를 가리키는가 (0831 추가)
+#      문서에 tools/xxx.py 라 써 있는데 그 파일이 없으면 팀원이 그대로 치고
+#      "명령을 찾을 수 없다" 로 막힌다. 실제로 mode_sim.py / serial_console.py
+#      두 개가 이 상태였다.
+_docdir = os.path.dirname(TOOLS.rstrip("/"))
+for _fn in sorted(os.listdir(_docdir)):
+    if not _fn.endswith(".md"):
+        continue
+    try:
+        _txt = open(os.path.join(_docdir, _fn), encoding="utf-8").read()
+    except Exception:
+        continue
+    for _ref in sorted(set(re.findall(r"tools/([A-Za-z0-9_]+\.py)", _txt))):
+        if not os.path.exists(os.path.join(TOOLS, _ref)):
+            bad("%s 가 없는 도구를 가리킨다: tools/%s" % (_fn, _ref),
+                "[13] 문서↔도구")
+
 order = {"🔴": 0, "🟡": 1, "ℹ️": 2}
 problems.sort(key=lambda x: (order[x[0]], x[1]))
 cur = None

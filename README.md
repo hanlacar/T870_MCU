@@ -291,7 +291,7 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 | `tools/audit.py` | 소스 ↔ yaml 정합성 감사 (ROS 불필요) |
 | `tools/drive_wasd.py` | 키보드 수동 조종 |
 | `tools/check_ports.py` | 어느 포트가 뭔지 확인 |
-| `tools/serial_console.py` | MCU 에 명령 직접 입력 (`A600` 조향끝값, `AR1` 안티롤백, `B` 급제동). ROS 불필요 |
+| `tools/serial_console_v2_0830.py` | MCU 에 명령 직접 입력 (`A600` 조향끝값, `AR1` 안티롤백, `B` 급제동). ROS 불필요 |
 | `tools/odom_calib.py` | counts_per_meter 검증 (ROS) |
 | `tools/odom_compare.py` | 줄자↔엔코더↔우리 거리↔`/odom` 4중 비교 |
 | `tools/run_v4_0830.py` | `[초] [단]` 지정 주행 후 자동 정지. 조향 명령 안 보냄 |
@@ -300,7 +300,7 @@ ENCODER,CPR,163.0,DEBOUNCE_US,200,UPDATE_MS,100
 | `tools/serial_console_v2_0830.py` | MCU 명령 직접 입력 |
 | `tools/measure.py` | counts_per_meter 실측 (시리얼 직결) |
 | `tools/team_monitor.py` | 각 팀 토픽 수신 상태 |
-| `tools/mode_sim.py` | 모드 전환 시뮬레이션 |
+| `tools/mode_sim_v2_0831.py` | 모드 전환 시뮬레이션 |
 
 ---
 

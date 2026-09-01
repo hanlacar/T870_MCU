@@ -80,6 +80,13 @@ except ImportError:
 import serial
 
 from .diagnostics import check_subscriptions
+from .odom_math import (
+    center_twist,
+    front_wheel_to_rear_axle,
+    integrate_rear_axle,
+    rear_to_center,
+    yaw_rate,
+)
 from .protocol import (
     encoder_sanity,
     parse_drive_stage,
@@ -308,6 +315,26 @@ class McuBridge(Node):
         # AS5600 으로 실제 조향각을 재게 되면 true 가 정답이다.
         self.declare_parameter("odom_steer_compensation", True)
 
+        # ---------- 0831 오돔 v2 ----------
+        #  front_track_m : 앞 윤거 [m]. 엔코더가 한쪽 바퀴에만 있어서
+        #                  선회 중 생기는 기하 오차를 보정하는 데 쓴다.
+        #                  🔴 0 이면 보정을 끄고 예전 cos(δ) 동작 그대로.
+        #                     실측해서 넣을 것 (27도 선회에서 최대 37% 차이).
+        #  encoder_side  : 엔코더가 달린 앞바퀴. "left" | "right"
+        #                  🔴 틀리면 보정이 오차를 두 배로 키운다. 확인 필수.
+        #  odom_reference: "rear_axle"(v37 동작) | "center"(0831 확정, 정중앙)
+        #  encoder_mount : 엔코더가 무엇의 회전을 세는가
+        #    "axle_center"  앞축 중앙 (구동모터 축 / 디퍼렌셜 입력).
+        #                   오픈 디퍼렌셜에서 이 회전은 좌우 바퀴의 **평균** 이다.
+        #                   = 앞축 중심 이동거리 → cos(δ) 만으로 정확히 환산된다.
+        #                   윤거 보정은 필요 없다. (기본값)
+        #    "single_wheel" 앞바퀴 한쪽의 허브. 선회 중 그 바퀴는 차 중심선과
+        #                   다른 거리를 돌므로 윤거 보정이 필요하다.
+        self.declare_parameter("encoder_mount", "axle_center")
+        self.declare_parameter("front_track_m", 0.0)
+        self.declare_parameter("encoder_side", "left")
+        self.declare_parameter("odom_reference", "rear_axle")
+
         gp = lambda name: self.get_parameter(name).value
         # port: "auto" 면 USB 장치 정보로 아두이노를 직접 찾는다.
         #       고정하려면 "/dev/ttyACM1" 처럼 경로를 직접 넣으면 된다.
@@ -373,6 +400,17 @@ class McuBridge(Node):
         self.odom_vel_ratio = float(gp("odom_vel_error_ratio"))
         self.odom_vel_floor = float(gp("odom_vel_error_floor"))
         self.odom_steer_comp = bool(gp("odom_steer_compensation"))
+
+        self.encoder_mount = str(gp("encoder_mount")).strip().lower()
+        if self.encoder_mount not in ("axle_center", "single_wheel"):
+            raise ValueError("encoder_mount 는 axle_center 또는 single_wheel")
+        self.front_track = float(gp("front_track_m"))
+        self.encoder_side = str(gp("encoder_side")).strip().lower()
+        if self.encoder_side not in ("left", "right"):
+            raise ValueError("encoder_side 는 left 또는 right")
+        self.odom_reference = str(gp("odom_reference")).strip().lower()
+        if self.odom_reference not in ("rear_axle", "center"):
+            raise ValueError("odom_reference 는 rear_axle 또는 center")
         self._steer_range_warned = False
 
         if self.wheel_timeout_policy not in ("hold_last", "center"):
@@ -556,6 +594,22 @@ class McuBridge(Node):
             self.pub_wheel_legacy = None
             self.pub_tele_legacy = None
         self.pub_odom = self.create_publisher(Odometry, pt("pub_topic_odom"), 10)
+
+        #  ---- /odom 별칭 ----
+        #  우리는 원래 /mcu/odom 만 쏜다 (0829 에 팀원 노드와 이름이 겹쳐 물러섰다).
+        #  비워두면 발행하지 않는다. 켜기 전에 반드시 확인할 것:
+        #    미션팀 wheel_odom_node, 주차팀 mcu_odom_adapter.py 가 같은 /odom 을
+        #    쏘고 있다. 셋이 동시에 쏘면 구독자가 어느 걸 받을지 알 수 없다.
+        #    켤 때는 그 두 노드를 먼저 끄고, 팀에 공지한 뒤에 켠다.
+        self.declare_parameter("pub_topic_odom_alias", "")
+        _alias = str(self.get_parameter("pub_topic_odom_alias").value).strip()
+        if _alias and _alias != pt("pub_topic_odom"):
+            self.pub_odom_alias = self.create_publisher(Odometry, _alias, 10)
+            self.get_logger().warn(
+                "/odom 별칭 발행 켜짐: %s — 미션팀 wheel_odom_node 와 "
+                "주차팀 mcu_odom_adapter.py 가 꺼져 있는지 확인할 것" % _alias)
+        else:
+            self.pub_odom_alias = None
         self.tf_bc = TransformBroadcaster(self) if (TF_OK and self.publish_tf) else None
 
         self.declare_parameter("reset_estop_service", "/mcu/reset_estop")
@@ -1222,22 +1276,32 @@ class McuBridge(Node):
                 "시간 기반 추정이 어긋난 상태다. C(중앙 복귀) 후 다시 볼 것."
                 % (steer_deg, self.max_deg, steer_ms))
 
-        # 엔코더가 앞축(조향축)에 있으므로 뒤축 이동거리로 환산: d_rear = d_front·cos(δ)
-        # odom_steer_compensation=false 면 환산하지 않는다 (조향각을 못 믿을 때).
+        # ---- 앞바퀴 이동거리 → 뒤축 중심 이동거리 ----
+        #
+        #  이 차는 4WD 이고 앞축·뒤축 모두 오픈 디퍼렌셜이다 (0831 확정).
+        #  엔코더는 앞바퀴 "한쪽" 에만 있으므로 선회 중에는 그 바퀴가
+        #  차 중심선과 다른 거리를 돈다. 윤거(front_track_m)를 넣으면
+        #  그 기하를 정확히 보정한다. 0 이면 예전 cos(δ) 동작 그대로다.
+        #
+        #  ⚠ 차동 슬립(토크가 헛도는 바퀴로 몰리는 것)은 여기서 못 고친다.
+        #    그건 라이다 스캔매칭 오돔이나 비구동 바퀴가 필요하다.
         d_front = delta / self.cpm
-        d = d_front * math.cos(steer_rad) if self.odom_steer_comp else d_front
+        if self.odom_steer_comp:
+            #  앞축 중앙(모터/디퍼렌셜) 엔코더는 좌우 평균이라 이미 축 중심값이다.
+            #  → 윤거 보정 없이 cos(δ) 만 적용 (track=0 이 그 동작).
+            _track = (self.front_track
+                      if self.encoder_mount == "single_wheel" else 0.0)
+            d = front_wheel_to_rear_axle(
+                d_front, steer_rad, self.wheelbase,
+                _track, self.encoder_side)
+        else:
+            d = d_front
         speed = d / dt
         self.distance_m += abs(d)
 
         dtheta = d * math.tan(steer_rad) / self.wheelbase
-        if abs(dtheta) > 1e-9:
-            radius = d / dtheta
-            self.x += radius * (math.sin(self.th + dtheta) - math.sin(self.th))
-            self.y -= radius * (math.cos(self.th + dtheta) - math.cos(self.th))
-        else:
-            self.x += d * math.cos(self.th)
-            self.y += d * math.sin(self.th)
-        self.th = math.atan2(math.sin(self.th + dtheta), math.cos(self.th + dtheta))
+        self.x, self.y, self.th = integrate_rear_axle(
+            self.x, self.y, self.th, d, steer_rad, self.wheelbase)
 
         m = Float32(); m.data = float(speed); self.pub_speed.publish(m)
         m = Float32(); m.data = float(speed * 3.6); self.pub_speed_kph.publish(m)
@@ -1276,16 +1340,32 @@ class McuBridge(Node):
                    * abs(speed * math.tan(steer_rad) / self.wheelbase)
                    + self.odom_vel_floor)
 
+        # ---- 발행 기준점 ----
+        #
+        #  self.x / self.y 는 항상 **뒤축 중심** 이다 (자전거 모델이 주는 점).
+        #  odom_reference="center" 면 0831 확정대로 네 바퀴 허브 중심
+        #  (차량 정중앙)으로 옮겨서 발행한다.
+        #
+        #  ★ 중심점은 회전 중 횡속도 vy 가 0 이 아니다. (L/2)*wz 만큼 쓸린다.
+        #    이걸 빠뜨리면 EKF 가 조용히 틀어진다.
+        if self.odom_reference == "center":
+            px, py = rear_to_center(self.x, self.y, self.th, self.wheelbase)
+            vx, vy, wz = center_twist(speed, steer_rad, self.wheelbase)
+        else:
+            px, py = self.x, self.y
+            vx, vy, wz = speed, 0.0, yaw_rate(speed, steer_rad, self.wheelbase)
+
         odom = Odometry()
         odom.header.stamp = self.get_clock().now().to_msg()
         odom.header.frame_id = self.odom_frame
         odom.child_frame_id = self.base_frame
-        odom.pose.pose.position.x = self.x
-        odom.pose.pose.position.y = self.y
+        odom.pose.pose.position.x = px
+        odom.pose.pose.position.y = py
         odom.pose.pose.orientation.z = math.sin(self.th * 0.5)
         odom.pose.pose.orientation.w = math.cos(self.th * 0.5)
-        odom.twist.twist.linear.x = speed
-        odom.twist.twist.angular.z = speed * math.tan(steer_rad) / self.wheelbase
+        odom.twist.twist.linear.x = vx
+        odom.twist.twist.linear.y = vy
+        odom.twist.twist.angular.z = wz
 
         # 6x6 행렬, 행 우선. 순서는 x y z roll pitch yaw.
         # 2D 차량이라 z/roll/pitch 는 쓰지 않으므로 큰 값을 넣어
@@ -1302,7 +1382,10 @@ class McuBridge(Node):
 
         twist_cov = [0.0] * 36
         twist_cov[0]  = sigma_v * sigma_v             # vx
-        twist_cov[7]  = big                            # vy (횡슬립은 모델에 없음)
+        #  vy: rear_axle 기준이면 항상 0 이라 모르는 값(big).
+        #      center 기준이면 (L/2)*wz 로 모델이 아는 값이므로 wz 와 같은 신뢰도.
+        twist_cov[7]  = (sigma_w * sigma_w * (0.5 * self.wheelbase) ** 2
+                         if self.odom_reference == "center" else big)
         twist_cov[14] = big
         twist_cov[21] = big
         twist_cov[28] = big
@@ -1310,6 +1393,8 @@ class McuBridge(Node):
         odom.twist.covariance = twist_cov
 
         self.pub_odom.publish(odom)
+        if self.pub_odom_alias is not None:
+            self.pub_odom_alias.publish(odom)
 
         if self.tf_bc:
             # ★ 0829 수정: send_transform (X) → sendTransform (O)
@@ -1323,8 +1408,8 @@ class McuBridge(Node):
                 tf = TransformStamped()
                 tf.header = odom.header
                 tf.child_frame_id = self.base_frame
-                tf.transform.translation.x = self.x
-                tf.transform.translation.y = self.y
+                tf.transform.translation.x = px
+                tf.transform.translation.y = py
                 tf.transform.rotation.z = odom.pose.pose.orientation.z
                 tf.transform.rotation.w = odom.pose.pose.orientation.w
                 self.tf_bc.sendTransform(tf)

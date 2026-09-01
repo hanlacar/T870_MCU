@@ -121,6 +121,7 @@ class ManagerNode(Node):
         self.declare_parameter("avoidance_gate_sources", ["lidar"])
         #  신호가 이 시간보다 오래되면 끊긴 것으로 보고 막는다.
         self.declare_parameter("avoidance_gate_timeout_s", 1.0)
+        self.declare_parameter("avoidance_gate_wheel_handover", True)
 
         # 알 수 없는 모드가 왔을 때:
         #   keep    = 직전 모드 유지 (권장. 갑자기 조향 권한이 바뀌지 않는다)
@@ -245,6 +246,7 @@ class ManagerNode(Node):
                 raise ValueError(
                     "avoidance_gate_sources 에 알 수 없는 소스: %s" % src)
         self.gate_timeout = float(gp("avoidance_gate_timeout_s"))
+        self.gate_wheel_handover = bool(gp("avoidance_gate_wheel_handover"))
         self.gate_value = False         # 마지막으로 받은 게이트 값
         self.gate_at = 0.0              # 그 시각
 
@@ -644,8 +646,22 @@ class ManagerNode(Node):
         gate_reason = self._apply_gate(now)
 
         # ---- [5] 조향: 모드 게이트 (구동과 독립) ----
+        #  ★ 0831 — 게이트가 열린 동안에는 게이트 소스가 조향을 가져간다.
+        #
+        #    S자(5번)의 요구사항: "평소에는 카메라, /avoidance/active 가 뜨면 라이다".
+        #    이건 런타임 신호라 wheel_owner_overrides(모드별 정적 표)로는 못 쓴다.
+        #    예전 설정("5:lidar")은 게이트가 닫힌 평상시에 라이다가 막혀서
+        #    **조향이 중앙(직진)으로 폴백** 됐다. S자 한복판에서 직진한다는 뜻이다.
+        #    반대로 override 를 빼면 회피가 떠도 라이다가 조향을 못 한다.
+        #    그래서 게이트가 열린 순간에만 소유자를 넘긴다.
+        gate_owner = None
+        if (self.gate_wheel_handover and gate_reason is None
+                and self.mode in self.gate_modes and self.gate_sources):
+            gate_owner = self.gate_sources[0]
+
         wheel_value, wheel_used, wheel_ok, wheel_reason = self.wheel_gate.resolve(
-            self.mode, self.inputs, now, self.wheel_timeout, self._failsafe_wheel())
+            self.mode, self.inputs, now, self.wheel_timeout,
+            self._failsafe_wheel(), gate_owner)
 
         #  🔴 0831 추가 — "구간 연습이 안 된다" 의 최다 원인을 말로 알려준다.
         #

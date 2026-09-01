@@ -1,0 +1,97 @@
+# t870_frames_v2_0831.yaml — 센서 장착 위치 (static TF)
+#
+# ★ 0831 확정 사항
+#   원점 base_link = 네 바퀴 허브(바퀴 정중앙) 4점의 기하 중심 = 차량 정중앙, 축 높이
+#   base_footprint = 그 점을 지면에 내린 것 (z=0)
+#   축거 L = 0.73 m (MCU 실측). 뒤축 중심은 base_link 에서 x = -0.365, 앞축 중심은 x = +0.365
+#   좌표 규약 REP-103: x 앞(+)  y 왼쪽(+)  z 위(+)   roll x축 / pitch y축(고개 숙이면 +) / yaw z축(좌회전 +)
+#   단위 m, rad
+#   라이다 프레임명은 라이다팀(avoidance_sim, Lidar_ws) 것을 따른다: front_laser / rear_laser
+#
+# ★ v1(뒤축 기준) 과 다른 점
+#   v1 은 원점이 "뒤축 중심·지면" 이었다. v2 는 "정중앙·축 높이". 값을 그대로 옮기면 안 된다.
+#   뒤축 기준 x 값을 정중앙 기준으로 바꾸려면:  x_new = x_old - 0.365
+#   지면 기준 z 값을 축 높이 기준으로 바꾸려면:  z_new = z_old - r_w   (r_w = 바퀴 유효반경)
+#
+# ★ 🔴 표시는 아직 실측 안 된 값. 실측 전까지 이 파일을 실차 Nav2 에 쓰지 말 것.
+#   틀려도 에러는 안 나고 라이다가 본 장애물 위치가 통째로 어긋난다.
+#
+# 재는 법 (평지)
+#   1. 네 바퀴 허브 중심에 표시 → 앞축 중심(앞 두 허브 중점), 뒤축 중심(뒤 두 허브 중점) 표시
+#   2. 앞축 중심~뒤축 중심 선의 중점 = 원점. 다림추로 바닥에 내려 테이프
+#   3. 그 점에서 앞(+x) / 왼쪽(+y) / 위(+z) 로 각 센서까지 잰다
+#   4. z 는 지면에서 재는 게 편하면 지면값을 적고 "지면 기준" 이라 표기 → r_w 를 빼서 넣는다
+#
+# 이 파일은 t870_frames.launch.py 가 그대로 읽는다 (런치 수정 불필요).
+#   ros2 launch t870_mcu t870_frames.launch.py frames:=<이 파일 경로>
+#   ros2 run tf2_tools view_frames
+#   ros2 run tf2_ros tf2_echo base_link front_laser
+
+frames:
+  # ---- 차체: 지면 투영점 → 허브 높이 원점 ----
+  base_link:
+    parent: base_footprint
+    x: 0.0
+    y: 0.0
+    z: 0.13          # 🔴 r_w 바퀴 유효반경 (하중 실린 상태, 축 중심~지면). 0.13 은 스펙 지름 0.26 의 절반이며 실측 아님. 주차팀 URDF 는 0.14 를 씀
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+
+  # ---- 라이다 (RPLIDAR A2M12 x2) — 프레임명은 라이다팀 규약 ----
+  # 참고: 팀 코드에 있는 값 (전부 기본값/가정, 실측 아님, 원점 정의도 각자 다름)
+  #   avoidance_sim  front (0.65, 0, 0.20)           원점 미명시
+  #   Lidar_ws       front (0.75, 0, 0.10) rear (-0.75, 0, 0.10, yaw pi)  원점 미명시
+  #   t_parking URDF front x=+0.7225 rear x=-0.6825  원점 = 정중앙 (우리와 같음)
+  front_laser:
+    parent: base_link
+    x: 0.0           # 🔴 정중앙에서 앞으로
+    y: 0.0           # 🔴 좌우 중앙이면 0
+    z: 0.0           # 🔴 허브 높이 기준 (지면값이면 r_w 빼기)
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0         # 🔴 라이다 0° 표시가 차 정면과 이루는 각
+
+  rear_laser:
+    parent: base_link
+    x: 0.0           # 🔴 뒤쪽이면 음수
+    y: 0.0           # 🔴
+    z: 0.0           # 🔴
+    roll: 0.0
+    pitch: 0.0
+    yaw: 3.14159265  # 뒤를 보게 달았으면 180°. 다르게 달았으면 실측각으로 🔴
+
+  # ---- 카메라 (RealSense D456) ----
+  # 카메라팀 camera_mount.yaml 실측(commissioned) 값: 뒤축 중심 기준 (0.32, 0, 0.85), 아래로 5°
+  #   → 정중앙 기준 x = 0.32 - 0.365 = -0.045  (정중앙보다 4.5 cm 뒤)
+  #   → z 는 0.85 가 지면 기준이라고 보고 r_w 를 뺀다 (카메라팀에 "지면 기준인지" 확인 필요)
+  #   → pitch: 카메라팀은 "숙임 = 음수" 규약. REP-103 은 숙임 = 양수. 여기서는 +0.0873
+  camera_link:
+    parent: base_link
+    x: -0.045        # ← 카메라팀 0.32 를 정중앙 기준으로 환산
+    y: 0.0
+    z: 0.72          # ← 0.85 - 0.13. r_w 실측되면 다시 계산 🔴
+    roll: 0.0
+    pitch: 0.0872665 # 5° 아래 (REP-103 부호)
+    yaw: 0.0
+
+  # D456 내장 IMU. camera_link 기준 오프셋은 데이터시트 값 — 확인 후 기입
+  imu_link:
+    parent: camera_link
+    x: 0.0           # 🔴 D456 데이터시트
+    y: 0.0           # 🔴
+    z: 0.0           # 🔴
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+
+  # ---- GPS 안테나 (u-blox) ----
+  # GPS팀 gps_route.yaml 은 antenna_forward/lateral = 0 (원점에 있다고 가정). 실측 필요
+  gps_link:
+    parent: base_link
+    x: 0.0           # 🔴
+    y: 0.0           # 🔴
+    z: 0.0           # 🔴 안테나 위상중심 ≈ 안테나 윗면 중앙
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
