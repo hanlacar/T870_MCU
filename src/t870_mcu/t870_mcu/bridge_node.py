@@ -77,6 +77,7 @@ try:
 except ImportError:
     TF_OK = False
 
+import fcntl
 import serial
 
 from .diagnostics import check_subscriptions
@@ -331,6 +332,12 @@ class McuBridge(Node):
         #    "single_wheel" 앞바퀴 한쪽의 허브. 선회 중 그 바퀴는 차 중심선과
         #                   다른 거리를 돌므로 윤거 보정이 필요하다.
         self.declare_parameter("encoder_mount", "axle_center")
+        #  0901 실측 기록. 엔코더가 앞축 중앙(구동모터)이라 계산에는 안 쓰지만,
+        #  팀 공통 기준값이라 여기 남겨 두면 다른 팀이 참조할 수 있다.
+        #    ros2 param get /mcu_bridge front_track_width_m
+        self.declare_parameter("front_track_width_m", 0.775)
+        self.declare_parameter("rear_track_width_m", 0.785)
+        self.declare_parameter("wheel_radius_m", 0.135)
         self.declare_parameter("front_track_m", 0.0)
         self.declare_parameter("encoder_side", "left")
         self.declare_parameter("odom_reference", "rear_axle")
@@ -469,10 +476,17 @@ class McuBridge(Node):
         self._fw_msg_count = 0
 
         # ---------- 오도메트리 ----------
-        self.x = 0.0
+        self.x = self._odom_origin_x()
         self.y = 0.0
         self.th = 0.0
         self.distance_m = 0.0
+        #  (x, y, qz, qw) — 마지막으로 발행한 오돔 자세. TF 가 이걸 복사한다.
+        self._last_pose = (0.0, 0.0, 0.0, 1.0)
+        self._port_lock_fd = None
+        self._port_lock_path = None
+        self._port_busy_warned = False
+        self._dup_check_at = 0.0
+        self._dup_seen = set()
         self.prev_count = None
         self.prev_count_t = None
         self.last_motion_dir = 0      # 코스팅 시 사용할 직전 진행 방향
@@ -593,7 +607,8 @@ class McuBridge(Node):
             self.pub_drive_legacy = None
             self.pub_wheel_legacy = None
             self.pub_tele_legacy = None
-        self.pub_odom = self.create_publisher(Odometry, pt("pub_topic_odom"), 10)
+        self._odom_topic_name = pt("pub_topic_odom")
+        self.pub_odom = self.create_publisher(Odometry, self._odom_topic_name, 10)
 
         #  ---- /odom 별칭 ----
         #  우리는 원래 /mcu/odom 만 쏜다 (0829 에 팀원 노드와 이름이 겹쳐 물러섰다).
@@ -604,11 +619,13 @@ class McuBridge(Node):
         self.declare_parameter("pub_topic_odom_alias", "")
         _alias = str(self.get_parameter("pub_topic_odom_alias").value).strip()
         if _alias and _alias != pt("pub_topic_odom"):
+            self._odom_alias_name = _alias
             self.pub_odom_alias = self.create_publisher(Odometry, _alias, 10)
             self.get_logger().warn(
                 "/odom 별칭 발행 켜짐: %s — 미션팀 wheel_odom_node 와 "
                 "주차팀 mcu_odom_adapter.py 가 꺼져 있는지 확인할 것" % _alias)
         else:
+            self._odom_alias_name = ""
             self.pub_odom_alias = None
         self.tf_bc = TransformBroadcaster(self) if (TF_OK and self.publish_tf) else None
 
@@ -627,6 +644,15 @@ class McuBridge(Node):
 
         self.rx_thread = threading.Thread(target=self.rx_loop, daemon=True)
         self.rx_thread.start()
+        #  ★ TF 는 오돔과 분리해 항상 내보낸다 (_tf_tick 주석 참고).
+        #    아두이노가 없어도 base_link 프레임은 존재해야 한다.
+        self.declare_parameter("tf_publish_hz", 20.0)
+        _tf_hz = float(self.get_parameter("tf_publish_hz").value)
+        if _tf_hz > 0.0 and self.tf_bc:
+            self.tf_timer = self.create_timer(1.0 / _tf_hz, self._tf_tick)
+        else:
+            self.tf_timer = None
+
         self.tx_timer = self.create_timer(self.send_period, self.tx_tick)
         self.conn_timer = self.create_timer(0.2, self.conn_tick)
 
@@ -821,10 +847,12 @@ class McuBridge(Node):
 
     def cb_reset_odom(self, _request, response):
         """오도메트리를 원점으로. 누적 공분산도 함께 0 으로 되돌린다."""
-        self.x = 0.0
+        self.x = self._odom_origin_x()
         self.y = 0.0
         self.th = 0.0
         self.distance_m = 0.0
+        #  (x, y, qz, qw) — 마지막으로 발행한 오돔 자세. TF 가 이걸 복사한다.
+        self._last_pose = (0.0, 0.0, 0.0, 1.0)
         self.var_x = 0.0
         self.var_y = 0.0
         self.var_yaw = 0.0
@@ -837,6 +865,71 @@ class McuBridge(Node):
     # ============================================================
     # 연결 (논블로킹 상태머신)
     # ============================================================
+
+    def _check_duplicate_odom(self):
+        """우리가 쏘는 오돔 토픽을 다른 노드도 쏘고 있는지 본다."""
+        topics = [t for t in (self._odom_topic_name, self._odom_alias_name) if t]
+        for topic in topics:
+            try:
+                infos = self.get_publishers_info_by_topic(topic)
+            except Exception:
+                continue
+            others = []
+            for info in infos:
+                name = getattr(info, "node_name", "")
+                if name and name != self.get_name():
+                    ns = (getattr(info, "node_namespace", "") or "").rstrip("/")
+                    others.append((ns + "/" + name) if ns else "/" + name)
+            key = (topic, tuple(sorted(others)))
+            if others and key not in self._dup_seen:
+                self._dup_seen.add(key)
+                self.get_logger().error(
+                    "%s 를 다른 노드도 발행 중이다: %s\n"
+                    "  구독자가 어느 값을 받을지 알 수 없다. 한 곳만 남길 것.\n"
+                    "  후보: 미션팀 wheel_odom_node, 주차팀 mcu_odom_adapter.py"
+                    % (topic, ", ".join(sorted(others))))
+
+    def _lock_port(self, port):
+        """포트를 배타적으로 잠근다. 이미 다른 브릿지가 쓰면 False.
+
+        같은 프로세스에서 재연결할 때는 이미 우리가 들고 있으므로 통과시킨다.
+        """
+        if self._port_lock_path == port and self._port_lock_fd is not None:
+            return True
+        self._release_port_lock()
+        path = "/tmp/t870_mcu%s.lock" % str(port).replace("/", "_")
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            if not self._port_busy_warned:
+                self._port_busy_warned = True
+                self.get_logger().error(
+                    "%s 를 다른 mcu_bridge 가 이미 쓰고 있다. 이 노드는 "
+                    "연결하지 않는다. 브릿지는 한 대만 띄울 것.\n"
+                    "  확인: ros2 node list | grep mcu_bridge" % port)
+            return False
+        except Exception:
+            return True            # 잠금을 못 걸면 막지는 않는다
+        self._port_lock_fd = fd
+        self._port_lock_path = port
+        self._port_busy_warned = False
+        return True
+
+    def _release_port_lock(self):
+        if self._port_lock_fd is None:
+            return
+        try:
+            fcntl.flock(self._port_lock_fd, fcntl.LOCK_UN)
+            os.close(self._port_lock_fd)
+        except Exception:
+            pass
+        self._port_lock_fd = None
+        self._port_lock_path = None
 
     def _try_open(self):
         now = time.monotonic()
@@ -856,6 +949,15 @@ class McuBridge(Node):
                 self.port = ""      # 아직 안 꽂혔다. 다음 주기에 다시 찾는다.
 
         if not self.port:
+            return
+
+        #  ★ 0901 — 포트 배타 잠금.
+        #    브릿지가 두 개 뜨면 둘 다 같은 포트를 열려고 한다. 리눅스는
+        #    같은 tty 를 두 프로세스가 여는 걸 막지 않아서, 두 프로세스가
+        #    번갈아 명령을 쏘고 STATUS 를 반씩 나눠 받는 상태가 된다.
+        #    "가끔 명령이 씹힌다" 로만 보여서 원인 찾기가 매우 어렵다.
+        #    flock 으로 먼저 잡은 쪽만 쓰게 한다.
+        if not self._lock_port(self.port):
             return
 
         try:
@@ -952,6 +1054,14 @@ class McuBridge(Node):
                     "STATUS 수신 두절 %.1fs — 엔코더/상태 갱신 없음. "
                     "구동 명령은 계속 전송 중이므로 주의." % self.telemetry_timeout)
                 self._telemetry_warned = True
+
+        #  ★ 0901 — /odom 중복 발행자 감시.
+        #    미션팀 wheel_odom_node, 주차팀 mcu_odom_adapter.py 가 같은
+        #    이름으로 쏘면 구독자는 어느 걸 받을지 알 수 없다. 에러가 안 나서
+        #    RViz 에서 차가 튀는 걸로만 나타난다. 5초마다 한 번 확인한다.
+        if now - self._dup_check_at >= 5.0:
+            self._dup_check_at = now
+            self._check_duplicate_odom()
 
         m = Bool(); m.data = (self.conn_state == CONN_READY); self.pub_conn.publish(m)
         m = Bool(); m.data = self.estop_latched; self.pub_estop.publish(m)
@@ -1392,37 +1502,86 @@ class McuBridge(Node):
         twist_cov[35] = sigma_w * sigma_w             # wz
         odom.twist.covariance = twist_cov
 
+        #  ★ 0901 — TF 는 이 자세를 **다시 계산하지 않고 복사** 한다.
+        #    예전에는 _tf_tick 이 self.x/y/th 로 따로 계산했다. 값은 같아
+        #    보여도 두 곳에서 계산하면 언젠가 어긋난다 (odom_reference 를
+        #    한쪽만 고치는 식으로). 저장해 두고 복사하면 구조적으로 불가능해진다.
+        self._last_pose = (
+            odom.pose.pose.position.x,
+            odom.pose.pose.position.y,
+            odom.pose.pose.orientation.z,
+            odom.pose.pose.orientation.w,
+        )
+
         self.pub_odom.publish(odom)
         if self.pub_odom_alias is not None:
             self.pub_odom_alias.publish(odom)
 
-        if self.tf_bc:
-            # ★ 0829 수정: send_transform (X) → sendTransform (O)
-            #   tf2_ros 파이썬 API 는 카멜케이스다. 이 오타 하나 때문에
-            #   매 STATUS 마다 예외가 나면서 둘이 같이 죽어 있었다.
-            #     1) TF 가 한 번도 발행되지 않음
-            #     2) handle_line 에서 이 뒤에 있던 펌웨어 fault 감지가 건너뛰어짐
-            #        → 아두이노가 FAULT 를 내도 E-Stop 래치가 안 걸렸다
-            #   TF 실패가 다른 처리를 막지 않도록 여기서 따로 잡는다.
-            try:
-                tf = TransformStamped()
-                tf.header = odom.header
-                tf.child_frame_id = self.base_frame
-                tf.transform.translation.x = px
-                tf.transform.translation.y = py
-                tf.transform.rotation.z = odom.pose.pose.orientation.z
-                tf.transform.rotation.w = odom.pose.pose.orientation.w
-                self.tf_bc.sendTransform(tf)
-            except Exception as exc:
-                if not self._tf_warned:
-                    self._tf_warned = True
-                    self.get_logger().error(
-                        "TF 발행 실패: %s — TF 없이 계속한다 "
-                        "(/odom 토픽은 정상)" % exc)
-
     # ============================================================
 
+    def _odom_origin_x(self):
+        """오돔 시작 시 **뒤축 중심** 의 x 좌표.
+
+        self.x/y/th 는 항상 뒤축 중심이다. 그런데 발행은 odom_reference 에 따라
+        정중앙으로 옮겨서 나간다. 그러면 정지 상태에서 base_link 가
+        odom 원점이 아니라 (L/2, 0) 에 찍힌다 — "출발도 안 했는데 36 cm 앞에
+        있다" 로 보인다.
+
+        그래서 center 기준일 때는 뒤축을 -L/2 에서 시작시킨다.
+        그러면 정중앙이 정확히 (0,0) 에서 출발한다.
+        """
+        return -0.5 * self.wheelbase if self.odom_reference == "center" else 0.0
+
+    def _tf_tick(self):
+        """odom→base_frame TF 를 **일정 주기로** 내보낸다.
+
+        ★ 0901 — 예전에는 update_odom() 안에서만 보냈다. 그러면 TF 가
+          아두이노 STATUS 에 매달린다. 실제로 이런 일이 벌어졌다:
+
+            · 아두이노가 안 꽂혔거나 STATUS 가 안 온다
+            · 엔코더 값이 깨져 _sane_encoder 가 None 을 돌려준다
+            · counts_per_meter 가 0 이다
+            · 차가 아직 한 번도 안 움직였다 (첫 STATUS 는 기준점만 잡고 return)
+
+          이 중 아무거나 하나만 걸려도 **base_link 프레임이 아예 생기지 않는다.**
+          그러면 TF 트리가 두 조각으로 갈라진다:
+              map → odom            (slam_toolbox)
+              base_link → laser     (static)
+          두 조각이 이어지지 않으니 slam_toolbox 는 스캔을 큐에 쌓다가
+          "Message Filter dropping message ... queue is full" 로 전부 버린다.
+          에러 메시지에는 TF 이야기가 안 나와서 원인 찾기가 매우 어렵다.
+
+          그래서 TF 는 오돔 계산과 분리해 항상 내보낸다. 차가 안 움직였으면
+          원점(0,0,0)이 나가고, 그것만으로도 트리는 이어진다.
+        """
+        if not self.tf_bc:
+            return
+        try:
+            #  마지막으로 **발행한 오돔** 의 자세를 그대로 쓴다. 재계산 없음.
+            #  오돔이 한 번도 안 나갔으면 원점(항등)을 내보낸다 — 그래야
+            #  아두이노가 없어도 base_link 프레임이 존재한다.
+            px, py, qz, qw = self._last_pose
+
+            tf = TransformStamped()
+            tf.header.stamp = self.get_clock().now().to_msg()
+            tf.header.frame_id = self.odom_frame
+            tf.child_frame_id = self.base_frame
+            tf.transform.translation.x = px
+            tf.transform.translation.y = py
+            tf.transform.rotation.z = qz
+            tf.transform.rotation.w = qw
+            self.tf_bc.sendTransform(tf)
+        except Exception as exc:
+            # ★ 0829: 여기서 예외가 나도 다른 처리를 막지 않는다.
+            #   (send_transform 오타 때문에 fault 감지까지 죽었던 적이 있다)
+            if not self._tf_warned:
+                self._tf_warned = True
+                self.get_logger().error(
+                    "TF 발행 실패: %s — TF 없이 계속한다 "
+                    "(오돔 토픽은 정상)" % exc)
+
     def shutdown(self):
+        self._release_port_lock()
         try:
             self.send_line("1.00")
             time.sleep(0.05)

@@ -96,6 +96,24 @@ class InputManager:
 
     # ---- 조회 ----
 
+    def invalidate_all(self, reason: str = "mode_changed") -> None:
+        """모든 소스의 구동·조향 명령을 즉시 무효화한다.
+
+        ★ 왜 필요한가 (0901)
+          모드가 7(T주차)에서 8(정지선까지)로 넘어가는 순간, 라이다가 마지막에
+          보낸 조향값은 타임아웃(0.5초) 전까지 여전히 "신선한" 값이다.
+          8번의 권한자는 카메라인데, 카메라가 아직 첫 명령을 안 보냈다면
+          그 0.5초 동안 **직전 구간의 명령이 그대로 살아있다.**
+          주차 막판의 큰 조향각이 다음 구간 출발에 그대로 먹히면 위험하다.
+
+          급정거(stop)는 건드리지 않는다. 안전 신호는 모드와 무관하게 유효하다.
+        """
+        for state in self.states.values():
+            state.drive.valid = False
+            state.drive.reason = reason
+            state.wheel.valid = False
+            state.wheel.reason = reason
+
     def set_blocked(self, blocked: Dict[str, str]) -> None:
         """{소스: 사유} 로 막는다. 매 주기 통째로 갈아끼운다."""
         self.blocked = dict(blocked or {})

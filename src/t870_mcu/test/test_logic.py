@@ -858,3 +858,76 @@ def test_new_mode_table_is_0_to_11():
     assert gate.owner("10") == "lidar"
     for i in (1, 2, 3, 4, 5, 6, 8, 9, 11):
         assert gate.owner(str(i)) == "camera"
+
+
+# ============================================================
+# 0901 — 모드 전환 시 이전 구간 명령 무효화
+# ============================================================
+
+def test_invalidate_clears_drive_and_wheel():
+    """모드가 바뀌면 직전 구간의 구동·조향이 즉시 무효가 된다."""
+    inputs = InputManager(["lidar", "camera"])
+    now = 100.0
+    inputs.update_drive("lidar", 2.0, now, True, "ok")
+    inputs.update_wheel("lidar", -25, now, True, "ok")
+    assert inputs.drive_status("lidar", now, 1.0)[0] is True
+    assert inputs.wheel_status("lidar", now, 1.0)[0] is True
+
+    inputs.invalidate_all("mode_changed")
+
+    ok, reason, _ = inputs.drive_status("lidar", now, 1.0)
+    assert ok is False and reason == "mode_changed"
+    ok, reason, _ = inputs.wheel_status("lidar", now, 1.0)
+    assert ok is False and reason == "mode_changed"
+
+
+def test_invalidate_does_not_touch_stop():
+    """급정거는 무효화하지 않는다 — 안전은 모드와 무관하다."""
+    inputs = InputManager(["lidar", "camera"])
+    now = 100.0
+    inputs.update_stop("camera", True, now)
+    inputs.invalidate_all("mode_changed")
+    assert inputs.stop_asserted("camera", now, 1.0) is True
+
+
+def test_invalidate_recovers_on_next_command():
+    """새 권한자가 명령을 보내면 바로 정상으로 돌아온다."""
+    inputs = InputManager(["camera"])
+    now = 100.0
+    inputs.update_drive("camera", 1.0, now, True, "ok")
+    inputs.invalidate_all("mode_changed")
+    assert inputs.drive_status("camera", now, 1.0)[0] is False
+
+    inputs.update_drive("camera", 1.0, now + 0.05, True, "ok")
+    ok, _, value = inputs.drive_status("camera", now + 0.05, 1.0)
+    assert ok is True and value == 1.0
+
+
+def test_invalidate_all_sources_at_once():
+    inputs = InputManager(["lidar", "camera", "gps"])
+    now = 100.0
+    for src in ("lidar", "camera", "gps"):
+        inputs.update_drive(src, 1.0, now, True, "ok")
+    inputs.invalidate_all()
+    for src in ("lidar", "camera", "gps"):
+        assert inputs.drive_status(src, now, 1.0)[0] is False
+
+
+def test_parking_handover_scenario():
+    """7번(라이다 주차) → 8번(카메라) 전환에서 라이다 조향이 새지 않는다.
+
+    실제 위험: 주차 막판의 큰 조향각이 다음 구간 출발에 그대로 먹힌다.
+    """
+    inputs = InputManager(["lidar", "camera"])
+    gate = WheelGate("camera", ["7:lidar", "10:lidar"],
+                     ["lidar", "camera"], [str(i) for i in range(12)])
+    now = 100.0
+    inputs.update_wheel("lidar", -27, now, True, "ok")     # 주차 막판 최대 조향
+
+    # 7번에서는 라이다가 권한자
+    assert gate.resolve("7", inputs, now, 1.0, 0)[:2] == (-27, "lidar")
+
+    # 8번으로 전환 + 무효화 → 카메라가 아직 조용하니 폴백(중앙)
+    inputs.invalidate_all("mode_changed")
+    value, used, ok, _ = gate.resolve("8", inputs, now, 1.0, 0)
+    assert value == 0 and used == FAILSAFE and ok is False

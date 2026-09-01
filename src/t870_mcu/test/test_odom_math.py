@@ -219,3 +219,60 @@ def test_full_chain_wheel_correction_changes_result():
     a = run(0.0)
     b = run(T)
     assert abs(a[2] - b[2]) > 0.05          # 방위가 눈에 띄게 다르다
+
+
+# ============================================================
+# 0901 — 정중앙 기준 발행 확정. 원점 이동과 static TF 의 짝 검증
+# ============================================================
+
+def test_center_offset_matches_frames_yaml_shift():
+    """static TF 의 x 를 0.365 빼는 것과 오돔 원점 이동은 같은 값이어야 한다.
+
+    한쪽만 바꾸면 센서가 본 것이 통째로 어긋난다. 숫자를 여기 고정해 둔다.
+    """
+    shift = L / 2
+    assert shift == pytest.approx(0.365)
+    # t870_frames.yaml 에 실제로 들어간 값
+    assert 1.10 - shift == pytest.approx(0.735)
+    assert 1.05 - shift == pytest.approx(0.685)
+    assert 0.20 - shift == pytest.approx(-0.165)
+
+
+def test_center_pose_equals_rear_pose_plus_shift():
+    """같은 주행에서 center 자세 = rear 자세 + L/2 (진행방향)."""
+    x = y = th = 0.0
+    for _ in range(300):
+        x, y, th = integrate_rear_axle(x, y, th, 0.01, math.radians(15), L)
+    cx, cy = rear_to_center(x, y, th, L)
+    assert math.hypot(cx - x, cy - y) == pytest.approx(L / 2)
+    # 진행 방향으로 앞서 있다
+    assert (cx - x) * math.cos(th) + (cy - y) * math.sin(th) > 0
+
+
+def test_center_start_is_ahead_of_rear_start():
+    """정지 상태에서도 중심점은 뒤축보다 0.365 m 앞이다."""
+    cx, cy = rear_to_center(0.0, 0.0, 0.0, L)
+    assert cx == pytest.approx(0.365)
+    assert cy == pytest.approx(0.0)
+
+
+def test_center_origin_starts_at_zero():
+    """center 기준이면 뒤축을 -L/2 에서 시작시켜야 발행 위치가 (0,0) 이다.
+
+    안 그러면 정지 상태에서 base_link 가 odom 원점보다 36 cm 앞에 찍혀
+    "출발도 안 했는데 앞에 있다" 로 보인다. 브릿지 _odom_origin_x() 와 짝.
+    """
+    x0 = -0.5 * L
+    px, py = rear_to_center(x0, 0.0, 0.0, L)
+    assert px == pytest.approx(0.0, abs=1e-12)
+    assert py == pytest.approx(0.0, abs=1e-12)
+
+
+def test_center_origin_holds_at_any_heading():
+    """어느 방향을 보고 있어도 시작점 보정은 정확히 원점을 준다."""
+    for deg in range(0, 360, 45):
+        th = math.radians(deg)
+        x0 = -0.5 * L * math.cos(th)
+        y0 = -0.5 * L * math.sin(th)
+        px, py = rear_to_center(x0, y0, th, L)
+        assert math.hypot(px, py) == pytest.approx(0.0, abs=1e-12)

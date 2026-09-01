@@ -122,6 +122,7 @@ class ManagerNode(Node):
         #  신호가 이 시간보다 오래되면 끊긴 것으로 보고 막는다.
         self.declare_parameter("avoidance_gate_timeout_s", 1.0)
         self.declare_parameter("avoidance_gate_wheel_handover", True)
+        self.declare_parameter("invalidate_on_mode_change", True)
 
         # 알 수 없는 모드가 왔을 때:
         #   keep    = 직전 모드 유지 (권장. 갑자기 조향 권한이 바뀌지 않는다)
@@ -247,6 +248,7 @@ class ManagerNode(Node):
                     "avoidance_gate_sources 에 알 수 없는 소스: %s" % src)
         self.gate_timeout = float(gp("avoidance_gate_timeout_s"))
         self.gate_wheel_handover = bool(gp("avoidance_gate_wheel_handover"))
+        self.invalidate_on_mode_change = bool(gp("invalidate_on_mode_change"))
         self.gate_value = False         # 마지막으로 받은 게이트 값
         self.gate_at = 0.0              # 그 시각
 
@@ -597,6 +599,17 @@ class ManagerNode(Node):
                 "모드 %s -> %s (조향권한 %s -> %s)"
                 % (self.mode, new_mode, old_owner, new_owner))
             self.mode = new_mode
+
+            #  ★ 0901 — 직전 구간의 명령이 다음 구간으로 새는 것을 막는다.
+            #    타임아웃(0.5초) 전까지는 옛 명령이 "신선한" 값으로 남아
+            #    새 권한자가 첫 명령을 보내기 전에 그대로 먹힌다.
+            #    급정거는 무효화하지 않는다 (안전은 모드와 무관).
+            if self.invalidate_on_mode_change:
+                self.inputs.invalidate_all("mode_changed")
+                self.get_logger().info(
+                    "  이전 구간 명령을 무효화했다 — 새 권한자의 첫 명령까지 "
+                    "구동 정지·조향 %s"
+                    % ("중앙" if self.wheel_failsafe_mode == "center" else "유지"))
 
     def _cb_estop(self, msg):
         """E-stop 상태를 그대로 반영한다.

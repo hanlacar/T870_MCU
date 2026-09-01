@@ -35,6 +35,22 @@ def _make_nodes(context, *args, **kwargs):
     if not frames:
         raise RuntimeError("%s 에 frames 항목이 없다" % path)
 
+    #  ★ 0901 — 쏘기 전에 구조를 검증한다.
+    #    TF 가 잘못되면 에러가 안 난다. 트리가 갈라지면 slam_toolbox 가
+    #    스캔을 전부 버리는데, 로그에는 "queue is full" 만 나와서
+    #    원인이 TF 라는 걸 알아내는 데만 하루가 걸린다.
+    #    여기서 막으면 launch 가 즉시 이유를 말하고 멈춘다.
+    try:
+        from t870_mcu.frame_contract import validate_frames
+    except ImportError:
+        validate_frames = None
+    if validate_frames is not None:
+        ok, problems = validate_frames(frames)
+        if not ok:
+            raise RuntimeError(
+                "%s 의 프레임 정의에 문제가 있다:\n  - %s"
+                % (path, "\n  - ".join(problems)))
+
     nodes = []
     for child, cfg in frames.items():
         parent = str(cfg.get("parent", "base_link"))
