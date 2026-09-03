@@ -931,3 +931,187 @@ def test_parking_handover_scenario():
     inputs.invalidate_all("mode_changed")
     value, used, ok, _ = gate.resolve("8", inputs, now, 1.0, 0)
     assert value == 0 and used == FAILSAFE and ok is False
+
+
+# ============================================================
+# 0902 — 현장 조향 권한 변경 (9/6 "or" 구간 대응)
+# ============================================================
+
+def _owner_gate():
+    return WheelGate("camera", ["7:lidar", "10:lidar"],
+                     ["lidar", "camera", "gps"],
+                     [str(i) for i in range(12)])
+
+
+def test_set_owner_changes_authority():
+    g = _owner_gate()
+    assert g.owner("5") == "camera"
+    g.set_owner("5", "lidar")
+    assert g.owner("5") == "lidar"
+
+
+def test_set_owner_empty_restores_default():
+    """소스를 비우면 기본 권한자로 돌아온다."""
+    g = _owner_gate()
+    assert g.owner("7") == "lidar"
+    g.set_owner("7", "")
+    assert g.owner("7") == "camera"
+
+
+def test_set_owner_rejects_unknown_source():
+    g = _owner_gate()
+    msg = g.set_owner("5", "radar")
+    assert "거부" in msg
+    assert g.owner("5") == "camera"        # 안 바뀌어야 한다
+
+
+def test_set_owner_rejects_unknown_mode():
+    g = _owner_gate()
+    msg = g.set_owner("99", "lidar")
+    assert "거부" in msg
+    assert "99" not in g.overrides
+
+
+def test_set_owner_accepts_center_and_none():
+    g = _owner_gate()
+    assert "거부" not in g.set_owner("3", "center")
+    assert g.owner("3") == "center"
+
+
+def test_owner_table_lists_all_modes():
+    g = _owner_gate()
+    table = g.owner_table()
+    for i in range(12):
+        assert "%d:" % i in table
+    assert "7:lidar" in table and "10:lidar" in table
+    assert "0:camera" in table
+
+
+def test_owner_table_reflects_runtime_change():
+    g = _owner_gate()
+    g.set_owner("9", "gps")
+    assert "9:gps" in g.owner_table()
+
+
+def test_set_owner_case_insensitive():
+    g = _owner_gate()
+    g.set_owner("5", "LIDAR")
+    assert g.owner("5") == "lidar"
+
+
+def test_gate_handover_still_wins_over_runtime_owner():
+    """회피 게이트는 런타임 권한보다 우선한다 (S자 안전)."""
+    g = _owner_gate()
+    g.set_owner("5", "gps")
+    assert g.owner("5") == "gps"
+    assert g.owner("5", gate_owner="lidar") == "lidar"
+
+
+# ============================================================
+# 0902 — 조향 폴백 사슬
+#   증상: 카메라 노드를 안 띄우고 GPS 만 꽂으면 구동은 나가는데
+#         조향이 중앙 고정돼서 차가 직진만 했다. 현장 시험이 막혔다.
+# ============================================================
+
+CHAIN = ["camera", "lidar", "gps"]
+
+
+def _chain_gate(chain=CHAIN):
+    return WheelGate("camera", ["7:lidar", "10:lidar"],
+                     ["lidar", "camera", "gps"],
+                     [str(i) for i in range(12)], chain)
+
+
+def test_gps_only_still_steers():
+    """★ 이 시험이 통과해야 GPS 단독 시험이 된다."""
+    inp = InputManager(["lidar", "camera", "gps"])
+    g = _chain_gate()
+    now = 100.0
+    inp.update_wheel("gps", 12, now, True, "ok")
+
+    value, used, ok, reason = g.resolve("1", inp, now, 0.5, 0)
+    assert value == 12
+    assert used == "gps"
+    assert ok is False                  # 폴백 중이라는 사실은 계속 알린다
+    assert "fallback:gps" in reason
+
+
+def test_fallback_follows_chain_order():
+    """카메라가 죽으면 사슬 순서대로 라이다 먼저, 그 다음 GPS."""
+    inp = InputManager(["lidar", "camera", "gps"])
+    g = _chain_gate()
+    now = 100.0
+    inp.update_wheel("lidar", -7, now, True, "ok")
+    inp.update_wheel("gps", 20, now, True, "ok")
+
+    value, used, _, _ = g.resolve("1", inp, now, 0.5, 0)
+    assert (value, used) == (-7, "lidar")
+
+
+def test_owner_recovers_and_takes_back():
+    """원래 권한자가 값을 다시 보내면 자동으로 되돌아간다."""
+    inp = InputManager(["lidar", "camera", "gps"])
+    g = _chain_gate()
+    now = 100.0
+    inp.update_wheel("gps", 12, now, True, "ok")
+    assert g.resolve("1", inp, now, 0.5, 0)[1] == "gps"
+
+    inp.update_wheel("camera", 3, now + 0.1, True, "ok")
+    value, used, ok, _ = g.resolve("1", inp, now + 0.1, 0.5, 0)
+    assert (value, used, ok) == (3, "camera", True)
+
+
+def test_all_silent_still_goes_center():
+    """아무도 없으면 예전처럼 중앙 고정. 안전 동작은 유지된다."""
+    inp = InputManager(["lidar", "camera", "gps"])
+    g = _chain_gate()
+    value, used, ok, reason = g.resolve("1", inp, 100.0, 0.5, 0)
+    assert value == 0 and used == FAILSAFE and ok is False
+    assert "camera" in reason and "lidar" in reason and "gps" in reason
+
+
+def test_empty_chain_is_old_behaviour():
+    """사슬을 비우면 예전 동작(즉시 중앙)으로 돌아간다 — 회귀 안전판."""
+    inp = InputManager(["lidar", "camera", "gps"])
+    g = _chain_gate(chain=[])
+    now = 100.0
+    inp.update_wheel("gps", 12, now, True, "ok")
+    assert g.resolve("1", inp, now, 0.5, 0)[1] == FAILSAFE
+
+
+def test_parking_mode_falls_back_too():
+    """7번 주차의 주인은 라이다. 라이다가 죽으면 사슬로 내려간다."""
+    inp = InputManager(["lidar", "camera", "gps"])
+    g = _chain_gate()
+    now = 100.0
+    inp.update_wheel("camera", 5, now, True, "ok")
+    value, used, ok, _ = g.resolve("7", inp, now, 0.5, 0)
+    assert (value, used, ok) == (5, "camera", False)
+
+
+def test_fallback_skips_the_dead_owner():
+    """사슬에 주인이 들어 있어도 두 번 시도하지 않는다."""
+    inp = InputManager(["lidar", "camera", "gps"])
+    g = _chain_gate()
+    now = 100.0
+    inp.update_wheel("gps", 9, now, True, "ok")
+    _, _, _, reason = g.resolve("1", inp, now, 0.5, 0)
+    assert reason.count("camera:") == 1
+
+
+def test_gate_owner_also_falls_back():
+    """회피 게이트가 라이다에 넘겼는데 라이다가 죽으면 사슬로."""
+    inp = InputManager(["lidar", "camera", "gps"])
+    g = _chain_gate()
+    now = 100.0
+    inp.update_wheel("camera", 4, now, True, "ok")
+    value, used, ok, _ = g.resolve("5", inp, now, 0.5, 0, gate_owner="lidar")
+    assert (value, used, ok) == (4, "camera", False)
+
+
+def test_unknown_source_in_chain_is_rejected():
+    """오타를 조용히 넘기지 않는다."""
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        WheelGate("camera", [], ["lidar", "camera", "gps"],
+                  [str(i) for i in range(12)], ["camera", "radar"])

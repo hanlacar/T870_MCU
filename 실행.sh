@@ -8,6 +8,7 @@
 #    창2)  ./실행.sh 중재      명령 중재기
 #    창3)  ./실행.sh 조종      WASD 수동 운전
 #    창4)  ./실행.sh 프레임    센서 위치 TF
+#    창5)  ./실행.sh 권한      조향 권한 전환 (9/6 현장용)
 #
 #  한 창에 브릿지+중재를 같이 띄우려면:
 #    ./실행.sh 전체
@@ -91,6 +92,13 @@ case "$MODE" in
     echo
     exec ros2 launch t870_mcu t870_frames.launch.py
     ;;
+  권한|owner)
+    echo
+    echo " 조향 권한 전환 (9/6 현장용). 매니저가 다른 창에 떠 있어야 한다."
+    echo " 모드 번호를 누르면 camera → lidar → gps → 기본값 순으로 바뀐다."
+    echo
+    exec python3 "$HERE/tools/owner_v1_0902.py"
+    ;;
   조종|drive)
     echo
     echo " ⚠ 브릿지가 다른 창에 떠 있어야 한다. 아니면 '아두이노 끊김' 이 뜬다."
@@ -112,6 +120,7 @@ case "$MODE" in
     echo "  창2)  ./실행.sh 중재      명령 중재기"
     echo "  창3)  ./실행.sh 조종      WASD 수동 운전"
     echo "  창4)  ./실행.sh 프레임    센서 위치 TF"
+    echo "  창5)  ./실행.sh 권한      조향 권한 전환 (9/6 현장용)"
     echo
     echo "  ./실행.sh 전체   브릿지+중재를 한 창에"
     echo "  ./실행.sh 점검   안 될 때 제일 먼저"
@@ -125,6 +134,7 @@ case "$MODE" in
     echo "  창2)  ./실행.sh 중재      명령 중재기"
     echo "  창3)  ./실행.sh 조종      WASD 수동 운전"
     echo "  창4)  ./실행.sh 프레임    센서 위치 TF"
+    echo "  창5)  ./실행.sh 권한      조향 권한 전환 (9/6 현장용)"
     echo
     echo "  ./실행.sh 전체   브릿지+중재를 한 창에"
     echo "  ./실행.sh 점검   안 될 때 제일 먼저"

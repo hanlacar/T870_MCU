@@ -457,6 +457,23 @@ mcu_manager:
     #     (그때 5번 구간의 권한자가 카메라였다).
     #     이제 그 상황에서 매니저가 무엇을 고쳐야 하는지까지 로그로 찍는다.
     wheel_owner_default: "camera"
+
+    #  ★ 0902 — 조향 폴백 사슬
+    #
+    #    구동은 예전부터 drive_priority 로 lidar→camera→gps 내려갔는데
+    #    **조향은 폴백이 없었다.** 모드 주인이 침묵하면 곧바로 중앙 고정.
+    #
+    #    그래서 카메라 노드를 안 띄우고 GPS 만 꽂아 시험하면
+    #      · 구동은 GPS 로 폴백해서 나간다
+    #      · 조향은 카메라가 주인인데 침묵 → 중앙 고정 → 직진만
+    #    즉 "차가 사실상 못 움직인다" 가 됐다. 현장 시험이 이것 때문에 막혔다.
+    #
+    #    이제 주인이 침묵하면 아래 순서로 내려간다.
+    #    끝까지 아무도 없을 때만 중앙(wheel_failsafe_mode)으로 간다.
+    #    원래 권한자가 값을 다시 보내면 자동으로 되돌아간다.
+    #
+    #    ⚠ 비워두면([]) 예전 동작(즉시 중앙 고정)으로 돌아간다.
+    wheel_fallback_chain: ["camera", "lidar", "gps"]
     # ==========================================================
     # 🔴 회피 게이트 (0831)
     # ==========================================================
@@ -497,13 +514,30 @@ mcu_manager:
     invalidate_on_mode_change: true
 
     wheel_owner_overrides:
-      #  0831 확정 — 좌회전까지는 카메라, 주차는 라이다.
-      #    5  S자        카메라가 기본, /avoidance/active 뜨면 라이다로 넘어감
-      #                  (avoidance_gate_modes 참고. override 가 아니라 게이트다)
-      #    7  T주차      라이다
-      #    10 평행주차   라이다. **도로 복귀까지 이 모드가 책임진다**
-      #    11 출차       종점까지 주행이므로 카메라 (GPS 상태가 좋으면 GPS)
-      #  나머지(1·2·3·4·6·8·9)는 전부 카메라 = wheel_owner_default
+      #  ★ 0902 — 9/6 현장 계획 (팀 화이트보드) 기준
+      #
+      #    모드  구간                     계획
+      #    ────────────────────────────────────────────────────
+      #     1·2  출발~경사로              카메라 → (GPS·SLAM)
+      #     3    직각코너~정지선          LIDAR + 카메라
+      #     4·6  정지선~교차로~횡단보도   카메라 + GPS → NAV2
+      #    ★5    S자                      카메라 or GPS + LIDAR
+      #    ★7    T주차                    Nav2 or GPS + LIDAR
+      #     8    T주차~정지선             카메라 + GPS
+      #     9    가속 후 좌회전           카메라 or GPS + LIDAR
+      #     10   평행주차                 7과 동일
+      #     11   출차                     카메라 + GPS
+      #
+      #  ⚠ "or" 가 붙은 구간(5·7·9)은 9/6 에 둘 다 돌려보고 정한다.
+      #    현장에서 yaml 을 고치지 말 것 — 재빌드에 몇 분이 날아간다.
+      #    대신 토픽으로 즉시 바꾼다:
+      #      ros2 topic pub --once /mcu/set_wheel_owner std_msgs/msg/String "{data: '5:gps'}"
+      #      ros2 topic echo /mcu/wheel_owner_table        # 지금 표 확인
+      #    확정된 뒤에 여기 옮겨 적는다.
+      #
+      #  ⚠ 3번 "LIDAR + 카메라" 는 라이다 역할이 미정이다.
+      #    조향까지 맡으면 "3:lidar" 를 넣고, 급정거(/lidar_stop) 와
+      #    회피 신호만 주는 것이면 지금처럼 카메라로 둔다. 현장에서 결정.
       - "7:lidar"      # T 주차
       - "10:lidar"     # 평행 주차 (주차 + 도로 복귀)
     wheel_failsafe_mode: "center"
@@ -552,6 +586,9 @@ mcu_manager:
     output_wheel_topic: "/mcu/cmd_wheel"
     output_stop_topic: "/mcu/cmd_stop"
 
+    #  현장에서 조향 권한을 즉시 바꾸는 토픽 (0902)
+    set_wheel_owner_topic: "/mcu/set_wheel_owner"
+    wheel_owner_table_topic: "/mcu/wheel_owner_table"
     status_mode_topic: "/mcu/current_mode"
     status_drive_source_topic: "/mcu/active_drive_source"
     status_wheel_source_topic: "/mcu/active_wheel_source"

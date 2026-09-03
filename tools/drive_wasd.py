@@ -22,6 +22,8 @@ drive_wasd_v1_0826.py  —  T870 키보드 수동 조종 (WASD)
     S  후진 (한 번 더 누르면 정지)
     A  조향 좌 3도
     D  조향 우 3도
+    ,  조향 좌 1도 (미세)
+    .  조향 우 1도 (미세)
     C  조향 중앙
 
     0      ★ 조종권 토글 (대기 <-> 키보드 전용)
@@ -83,6 +85,12 @@ from std_srvs.srv import Trigger
 FWD = [0.0, 1.0, 2.0, 3.0]
 STAGE_MPS = {0.0: 0.0, 1.0: 0.229, 2.0: 0.526, 3.0: 0.823, -1.0: 0.229}
 STEER_STEP = 3
+#  ★ 0901 — 미세 조향.
+#    ROS 경로(/manual_wheel)는 **정수 도** 라서 1도가 최소 단위다.
+#    브릿지가 1도 = 16.3ms 로 환산해 보낸다. 그보다 잘게 쪼개려면
+#    시리얼 직결 도구를 써야 한다:  python3 tools/drive_v2_0831.py
+#      거기서는  , .  = 10ms,   < >  = 1ms
+STEER_FINE = 1
 STEER_MAX = 27
 
 
@@ -346,6 +354,7 @@ def render(n):
 
     w("│  ── 키 ────────────────────────────────────────────")
     w("│   \033[1mW\033[0m 전진   \033[1mS\033[0m 후진   \033[1mA\033[0m 좌   \033[1mD\033[0m 우   \033[1mC\033[0m 중앙")
+    w("│   , . 조향 1도씩 (미세)    더 잘게는 tools/drive_v2_0831.py")
     w("│   Space 정지    F 급정거    E E-Stop    R 래치해제")
     w("│   1 2 3 단계직접   \033[1m0 조종권 토글\033[0m")
     w("│   Z 측정시작   X 측정끝   Q 종료")
@@ -384,7 +393,8 @@ def read_key(timeout):
     return {"A": "w", "B": "s", "C": "d", "D": "a"}.get(seq[-1])
 
 
-DRIVE_KEYS = ("w", "W", "s", "S", "a", "A", "d", "D", "c", "C", "1", "2", "3", " ")
+DRIVE_KEYS = ("w", "W", "s", "S", "a", "A", "d", "D", "c", "C",
+              ",", ".", "1", "2", "3", " ")
 
 
 def handle(n, k):
@@ -417,6 +427,10 @@ def handle(n, k):
         n.wheel = max(-STEER_MAX, n.wheel - STEER_STEP)
     elif k in ("d", "D"):
         n.wheel = min(STEER_MAX, n.wheel + STEER_STEP)
+    elif k == ",":
+        n.wheel = max(-STEER_MAX, n.wheel - STEER_FINE)
+    elif k == ".":
+        n.wheel = min(STEER_MAX, n.wheel + STEER_FINE)
     elif k in ("c", "C"):
         n.wheel = 0
 

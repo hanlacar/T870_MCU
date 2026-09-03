@@ -61,6 +61,9 @@ class ManagerNode(Node):
         self.declare_parameter("wheel_owner_default", "camera")
         self.declare_parameter(
             "wheel_owner_overrides", ["T_PARK:lidar", "PARALLEL_PARK:lidar"])
+        #  ★ 0902 — 조향 폴백 사슬. 모드 주인이 침묵하면 이 순서로 내려간다.
+        #    비워두면 예전처럼 곧바로 중앙 고정(직진)이 된다.
+        self.declare_parameter("wheel_fallback_chain", ["camera", "lidar", "gps"])
 
         # 대회 구간 모드 문자열 화이트리스트.
         # 여기 없는 모드가 /vehicle_mode 로 오면 ERROR 를 찍고 무시한다.
@@ -166,6 +169,11 @@ class ManagerNode(Node):
         self.declare_parameter("output_drive_topic", "/mcu/cmd_drive")
         self.declare_parameter("output_wheel_topic", "/mcu/cmd_wheel")
         self.declare_parameter("output_stop_topic", "/mcu/cmd_stop")
+        #  ★ 0902 — 현장에서 조향 권한을 바꾸는 토픽.
+        #    9/6 계획에 "카메라 or GPS + LIDAR" 처럼 안 정해진 구간이 많다.
+        #    yaml 고치고 재빌드하면 몇 분씩 걸려 현장에서 못 쓴다.
+        self.declare_parameter("set_wheel_owner_topic", "/mcu/set_wheel_owner")
+        self.declare_parameter("wheel_owner_table_topic", "/mcu/wheel_owner_table")
         self.declare_parameter("status_mode_topic", "/mcu/current_mode")
         self.declare_parameter("status_drive_source_topic", "/mcu/active_drive_source")
         self.declare_parameter("status_wheel_source_topic", "/mcu/active_wheel_source")
@@ -257,8 +265,11 @@ class ManagerNode(Node):
             raise ValueError("unknown_mode_policy 는 keep 또는 default")
         self.wheel_gate = WheelGate(
             gp("wheel_owner_default"), gp("wheel_owner_overrides"),
-            self.source_names, self.known_modes)
+            self.source_names, self.known_modes,
+            [str(x) for x in gp("wheel_fallback_chain")])
         self.unknown_mode_seen = ""     # 같은 오타를 한 번만 찍기 위한 기록
+        self._fallback_warned_src = ""
+        self._fallback_warned_at = 0.0
         #  조향 권한 경고 도배 방지 (0831)
         self._wheel_warn_key = ""
         self._wheel_warn_at = 0.0
@@ -351,6 +362,10 @@ class ManagerNode(Node):
         _mode_t = str(gp("mode_topic"))
         _estop_t = str(gp("estop_topic"))
         self.create_subscription(String, _mode_t, self._cb_mode, 10)
+        self.create_subscription(
+            String, str(gp("set_wheel_owner_topic")), self._cb_set_owner, 10)
+        self.pub_owner_table = self.create_publisher(
+            String, str(gp("wheel_owner_table_topic")), 10)
         self.create_subscription(Bool, _estop_t, self._cb_estop, 10)
         self._sub_specs.append((_mode_t, "std_msgs/msg/String", "구간 모드"))
         self._sub_specs.append((_estop_t, "std_msgs/msg/Bool", "비상정지"))
@@ -487,6 +502,24 @@ class ManagerNode(Node):
         if bool(msg.data) and not prev:
             self.get_logger().warn("급정거 요청: %s" % source)
 
+    def _warn_wheel_fallback(self, used, reason):
+        """폴백 사슬이 조향을 이어받았다. 정지는 아니지만 알려야 한다."""
+        now = time.monotonic()
+        if (used == self._fallback_warned_src
+                and now - self._fallback_warned_at < 5.0):
+            return
+        self._fallback_warned_src = used
+        self._fallback_warned_at = now
+        self.get_logger().warn(
+            "조향 폴백 — 모드 '%s' 의 권한자가 값을 안 줘서 '%s' 가 "
+            "조향을 이어받았다. 차는 조향한다." % (self.mode, used))
+        self.get_logger().warn("  · 사유: %s" % reason)
+        self.get_logger().warn(
+            "  · 원래 권한자가 값을 다시 보내면 자동으로 되돌아간다.")
+        self.get_logger().warn(
+            "  · 폴백 순서: %s (yaml 의 wheel_fallback_chain)"
+            % " → ".join(self.wheel_gate.fallback_chain))
+
     def _warn_wheel_owner(self, reason):
         """조향 권한자가 값을 안 줄 때, 무엇을 고쳐야 하는지까지 찍는다."""
         now = time.monotonic()
@@ -562,6 +595,35 @@ class ManagerNode(Node):
                        str(self.get_parameter("avoidance_gate_topic").value),
                        self.gate_timeout))
         return reason
+
+    def _cb_set_owner(self, msg):
+        """조향 권한을 런타임에 바꾼다.  형식 "모드:소스"
+
+            ros2 topic pub --once /mcu/set_wheel_owner std_msgs/msg/String "{data: '5:lidar'}"
+
+        소스를 비우면 기본 권한자로 되돌린다:  "5:"
+        지금 표를 보려면:  ros2 topic echo /mcu/wheel_owner_table
+
+        ⚠ 현장 실험용이다. 확정되면 yaml 의 wheel_owner_overrides 에 옮겨 적을 것.
+          노드를 다시 띄우면 여기서 바꾼 것은 사라진다.
+        """
+        text = str(msg.data).strip()
+        if ":" not in text:
+            self.get_logger().warn(
+                "조향 권한 변경 형식이 틀렸다: '%s' — \"모드:소스\" 로 보낼 것 "
+                "(예: 5:lidar, 되돌리려면 5:)" % text)
+            return
+
+        mode, source = text.split(":", 1)
+        result = self.wheel_gate.set_owner(mode, source)
+        self.get_logger().warn("조향 권한 변경 — %s" % result)
+
+        table = self.wheel_gate.owner_table()
+        self.get_logger().info("  현재 표: %s" % table)
+        self.pub_owner_table.publish(String(data=table))
+
+        #  바꾼 순간 이전 권한자의 명령이 남아 있으면 안 된다.
+        self.inputs.invalidate_all("owner_changed")
 
     def _cb_mode(self, msg):
         raw_mode = str(msg.data).strip().upper()
@@ -683,7 +745,14 @@ class ManagerNode(Node):
         #    WHEEL_FALLBACK(camera:never_received) 한 줄만 남아서, 왜 안 도는지
         #    알려면 이 코드를 읽어야 했다. 실제로 S자 코스 연습이 이것 때문에 막혔다.
         if not wheel_ok:
-            self._warn_wheel_owner(wheel_reason)
+            #  ★ 0902 — 폴백 사슬로 다른 소스가 조향을 이어받은 경우와
+            #    아무도 없어 중앙 고정된 경우는 전혀 다른 상황이다.
+            #    예전에는 둘 다 "조향이 중앙으로 고정된다" 로 찍혀서
+            #    실제로는 GPS 가 조향하고 있는데도 못 움직인다고 오해했다.
+            if wheel_used not in (FAILSAFE, CENTER_SOURCE):
+                self._warn_wheel_fallback(wheel_used, wheel_reason)
+            else:
+                self._warn_wheel_owner(wheel_reason)
 
         faults = []
 

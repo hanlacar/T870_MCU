@@ -204,8 +204,34 @@ class WheelGate:
     """
 
     def __init__(self, default_owner: str, override_entries: Iterable[str],
-                 known_sources: Iterable[str], known_modes: Iterable[str] = ()):
+                 known_sources: Iterable[str], known_modes: Iterable[str] = (),
+                 fallback_chain: Iterable[str] = ()):
         known = set(known_sources) | {CENTER_SOURCE, NO_SOURCE}
+        self.known_sources = known          # 런타임 권한 변경 검증에 쓴다
+
+        #  ★ 0902 — 조향 폴백 사슬.
+        #
+        #    지금까지 조향은 "모드가 정한 주인 한 명" 뿐이었다. 그 주인이
+        #    값을 안 주면 곧바로 중앙 고정(직진)이었다. 구동은
+        #    lidar→camera→gps 로 내려가는데 조향은 안 내려갔다.
+        #
+        #    그래서 카메라 노드를 안 띄우고 GPS 만 꽂아 시험하면
+        #      · 구동은 GPS 로 폴백해서 나간다
+        #      · 조향은 카메라가 주인인데 침묵 → 중앙 고정
+        #    즉 "차가 직진만 한다 = 사실상 못 움직인다" 가 됐다.
+        #    실제로 현장 시험이 이것 때문에 막혔다.
+        #
+        #    이제 주인이 침묵하면 이 순서대로 다음 소스를 찾는다.
+        #    끝까지 아무도 없을 때만 중앙으로 간다.
+        self.fallback_chain: List[str] = []
+        for entry in fallback_chain:
+            name = str(entry).strip().lower()
+            if not name:
+                continue
+            if name not in known:
+                raise ValueError("wheel_fallback_chain 에 알 수 없는 소스: %s" % name)
+            if name not in self.fallback_chain:
+                self.fallback_chain.append(name)
         self.default_owner = str(default_owner).strip().lower()
         if self.default_owner not in known:
             raise ValueError("wheel_owner_default 가 알 수 없는 소스: %s"
@@ -242,6 +268,43 @@ class WheelGate:
                 "wheel_owner_overrides 의 모드가 known_modes 에 없다: %s"
                 % sorted(unknown_override))
 
+    def set_owner(self, mode: str, source: str) -> str:
+        """모드 하나의 조향 권한자를 **런타임에** 바꾼다.
+
+        ★ 왜 필요한가 (0902)
+          9/6 현장 계획에 "카메라 or GPS + LIDAR" 처럼 아직 안 정해진 구간이
+          여럿 있다. 둘 다 돌려보고 정하는 건데, 그때마다 yaml 고치고
+          colcon build 하고 노드를 다시 띄우면 한 번에 몇 분씩 날아간다.
+          현장에서는 그 시간이 없다.
+
+        source 를 빈 문자열이나 "default" 로 주면 기본 권한자로 되돌린다.
+        반환값은 사람이 읽을 결과 문자열.
+        """
+        mode = str(mode).strip().upper()
+        source = str(source).strip().lower()
+
+        if source in ("", "default", "기본"):
+            if mode in self.overrides:
+                del self.overrides[mode]
+            return "모드 %s → 기본 권한자(%s)" % (mode, self.default_owner)
+
+        if source not in self.known_sources:
+            return ("거부: '%s' 는 없는 소스다. 가능: %s"
+                    % (source, ", ".join(sorted(self.known_sources))))
+
+        if self.known_modes and mode not in self.known_modes:
+            return "거부: '%s' 는 없는 모드다 (0~11)" % mode
+
+        self.overrides[mode] = source
+        return "모드 %s → %s" % (mode, source)
+
+    def owner_table(self) -> str:
+        """지금 권한표를 한 줄로. 상태 토픽으로 내보내 눈으로 확인한다."""
+        parts = []
+        for mode in sorted(self.known_modes, key=lambda m: (len(m), m)):
+            parts.append("%s:%s" % (mode, self.overrides.get(mode, self.default_owner)))
+        return " ".join(parts)
+
     def is_known(self, mode: str) -> bool:
         """known_modes 에 있는 모드인가. 목록이 비어 있으면 항상 True."""
         if not self.known_modes:
@@ -273,7 +336,20 @@ class WheelGate:
         ok, reason, value = inputs.wheel_status(own, now, timeout_s)
         if ok:
             return int(value), own, True, "ok"
-        return failsafe_value, FAILSAFE, False, "%s:%s" % (own, reason)
+
+        #  주인이 침묵 → 폴백 사슬을 순서대로 훑는다.
+        #  ok=False 를 유지해서 "폴백 중" 이라는 사실은 계속 알린다.
+        tried = ["%s:%s" % (own, reason)]
+        for alt in self.fallback_chain:
+            if alt == own or alt in (CENTER_SOURCE, NO_SOURCE):
+                continue
+            alt_ok, alt_reason, alt_value = inputs.wheel_status(alt, now, timeout_s)
+            if alt_ok:
+                return (int(alt_value), alt, False,
+                        "fallback:%s <- %s" % (alt, ",".join(tried)))
+            tried.append("%s:%s" % (alt, alt_reason))
+
+        return failsafe_value, FAILSAFE, False, ",".join(tried)
 
 
 # ============================================================

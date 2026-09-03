@@ -7,6 +7,10 @@
     조향 한 번 누를 때 움직이는 시간을 바꾸려면
         python3 tools/drive_v2_0831.py --steer-ms 20
 
+    미세 조향은 고정 스텝 키를 쓴다 (--steer-ms 와 무관)
+        , .   10ms 씩 좌/우   (1도 = 16.3ms 이므로 약 0.6도)
+        < >    1ms 씩 좌/우   (약 0.06도 — 중앙을 맞출 때)
+
     직진 중앙의 A0 기준값을 바꾸려면 (0830 실측 223)
         python3 tools/drive_v2_0831.py --center-adc 223
 
@@ -199,7 +203,9 @@ def main():
         w("│  ── 키 ──────────────────────────────────────────\n")
         w("│   w 전진1  e 전진2  r 전진3   s 후진1  x 후진2\n")
         w("│   [스페이스] 정지        f 급제동     0 즉시정지\n")
-        w("│   a/d 조향 좌/우   A/D 크게   [ ] 조향시간 조절\n")
+        w("│   a/d 조향 좌/우 %dms   A/D 크게(%dms)   [ ] 시간조절\n"
+          % (steer_ms, steer_ms * 5))
+        w("│   , . 10ms 미세      < > 1ms 초미세 (중앙 맞출 때)\n")
         w("│   z A0 %d 로 맞추기   c 누적0 복귀   m 지금을 중앙\n"
           % args.center_adc)
         w("│   o 엔코더 0        q 종료\n")
@@ -241,6 +247,19 @@ def main():
                     send("A%d" % (steer_ms * 5)); box["msg"] = "좌 %dms" % (steer_ms * 5)
                 elif k == "D":
                     send("D%d" % (steer_ms * 5)); box["msg"] = "우 %dms" % (steer_ms * 5)
+                #  ★ 0901 — 고정 스텝 미세 조향.
+                #    a/d 는 --steer-ms 값(가변)이라 지금 몇 ms 인지 헷갈린다.
+                #    아래는 항상 같은 양이라 "몇 번 눌렀는지" 로 각도를 셀 수 있다.
+                #      , .  = 10ms  (1도 = 16.3ms 니까 약 0.6도)
+                #      < >  =  1ms  (약 0.06도 — 중앙 미세조정용)
+                elif k == ",":
+                    send("A10"); box["msg"] = "좌 10ms"
+                elif k == ".":
+                    send("D10"); box["msg"] = "우 10ms"
+                elif k == "<":
+                    send("A1"); box["msg"] = "좌 1ms (미세)"
+                elif k == ">":
+                    send("D1"); box["msg"] = "우 1ms (미세)"
                 elif k == "[":
                     steer_ms = max(1, steer_ms - 5); box["msg"] = "조향 %dms" % steer_ms
                 elif k == "]":
